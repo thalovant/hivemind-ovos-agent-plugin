@@ -51,6 +51,28 @@ class TestClientIsolation:
 
         alice.send.assert_not_called()
 
+    def test_message_addressed_to_stale_peer_is_dropped_without_raising(self, agent, make_client):
+        alice = make_client("ws://alice")
+        alice.send.side_effect = RuntimeError("closed")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+
+        agent.handle_internal_mycroft(_ovos_internal("speak", destination="ws://alice"))
+
+        alice.send.assert_called_once()
+        assert agent.hm_protocol.clients == {}
+
+    def test_stale_peer_does_not_block_other_targets(self, agent, make_client):
+        alice = make_client("ws://alice")
+        bob = make_client("ws://bob")
+        alice.send.side_effect = RuntimeError("closed")
+        agent.hm_protocol.clients = {"ws://alice": alice, "ws://bob": bob}
+
+        agent.handle_internal_mycroft(_ovos_internal("speak", destination=["ws://alice", "ws://bob"]))
+
+        alice.send.assert_called_once()
+        bob.send.assert_called_once()
+        assert agent.hm_protocol.clients == {"ws://bob": bob}
+
     def test_forwarded_message_is_wrapped_as_bus_hivemessage(self, agent, make_client):
         alice = make_client("ws://alice")
         agent.hm_protocol.clients = {"ws://alice": alice}

@@ -56,6 +56,19 @@ class OVOSAgentProtocol(AgentProtocol):
         self.bus.on("hive.send.downstream", self.handle_send)
         self.bus.on("message", self.handle_internal_mycroft)  # catch all
 
+    def _send_to_client(self, peer: str, client, hmessage: HiveMessage) -> bool:
+        """Send a HiveMessage without letting stale sockets break bus dispatch."""
+        try:
+            client.send(hmessage)
+            return True
+        except Exception as exc:
+            LOG.warning(f"Could not send {hmessage.msg_type} to {peer}: {exc}")
+            try:
+                if self.hm_protocol and self.hm_protocol.clients.get(peer) is client:
+                    self.hm_protocol.clients.pop(peer, None)
+            except Exception:
+                LOG.exception(f"Failed to forget disconnected client: {peer}")
+            return False
 
     def natural_language_query(self, utterance: str,
                                lang: str) -> "Iterator[Optional[str]]":
@@ -121,15 +134,15 @@ class OVOSAgentProtocol(AgentProtocol):
         hmessage = HiveMessage(msg_type, payload=payload, target_peers=[peer])
 
         if msg_type in [HiveMessageType.PROPAGATE, HiveMessageType.BROADCAST]:
-            for peer in self.clients:
-                self.clients[peer].send(hmessage)
+            for peer, client in list(self.clients.items()):
+                self._send_to_client(peer, client, hmessage)
         elif msg_type == HiveMessageType.ESCALATE:
             # only slaves can escalate, ignore silently
             pass
         elif peer:
-            if peer in self.clients:
-                client = self.clients[peer]
-                client.send(hmessage)
+            client = self.clients.get(peer)
+            if client is not None:
+                self._send_to_client(peer, client, hmessage)
             else:
                 LOG.error("That client is not connected")
                 self.bus.emit(
@@ -150,7 +163,7 @@ class OVOSAgentProtocol(AgentProtocol):
             target_peers = [target_peers]
 
         if target_peers:
-            for peer, client in self.clients.items():
+            for peer, client in list(self.clients.items()):
                 if peer in target_peers:
                     LOG.debug(f"{message.msg_type} - destination: {peer}")
                     message.context["source"] = "hive"
@@ -160,7 +173,7 @@ class OVOSAgentProtocol(AgentProtocol):
                         target_peers=target_peers,
                         payload=message,
                     )
-                    client.send(msg)
+                    self._send_to_client(peer, client, msg)
 
 
 # back-compat alias for the old class name shipped from ovos-bus-client

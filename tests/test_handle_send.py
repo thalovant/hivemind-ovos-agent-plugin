@@ -26,6 +26,17 @@ class TestHandleSendDirect:
         assert isinstance(sent, HiveMessage)
         assert sent.msg_type == HiveMessageType.BUS
 
+    def test_stale_peer_send_is_dropped_without_raising(self, agent, make_client):
+        peer = "ws://stale"
+        client = make_client(peer)
+        client.send.side_effect = RuntimeError("closed")
+        agent.hm_protocol.clients = {peer: client}
+
+        agent.handle_send(_send_msg(HiveMessageType.BUS, peer=peer, payload={}))
+
+        client.send.assert_called_once()
+        assert agent.hm_protocol.clients == {}
+
     def test_unknown_peer_emits_error_on_bus(self, agent, make_client, fake_bus):
         seen = []
         fake_bus.on("hive.client.send.error", lambda m: seen.append(m))
@@ -59,6 +70,18 @@ class TestHandleSendFanout:
 
         for c in clients.values():
             c.send.assert_called_once()
+
+    def test_propagate_continues_after_stale_peer(self, agent, make_client):
+        peers = ["ws://stale", "ws://alive"]
+        clients = {p: make_client(p) for p in peers}
+        clients["ws://stale"].send.side_effect = RuntimeError("closed")
+        agent.hm_protocol.clients = dict(clients)
+
+        agent.handle_send(_send_msg(HiveMessageType.PROPAGATE, peer=peers[0], payload={}))
+
+        clients["ws://stale"].send.assert_called_once()
+        clients["ws://alive"].send.assert_called_once()
+        assert agent.hm_protocol.clients == {"ws://alive": clients["ws://alive"]}
 
     def test_broadcast_fans_out_to_all(self, agent, make_client):
         peers = [f"ws://{i}" for i in range(3)]
