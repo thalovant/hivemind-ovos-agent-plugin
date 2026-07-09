@@ -63,11 +63,9 @@ class OVOSAgentProtocol(AgentProtocol):
             return True
         except Exception as exc:
             LOG.warning(f"Could not send {hmessage.msg_type} to {peer}: {exc}")
-            try:
-                if self.hm_protocol and self.hm_protocol.clients.get(peer) is client:
-                    self.hm_protocol.clients.pop(peer, None)
-            except Exception:
-                LOG.exception(f"Failed to forget disconnected client: {peer}")
+            clients = getattr(getattr(self, "hm_protocol", None), "clients", None)
+            if clients is not None and clients.get(peer) is client:
+                clients.pop(peer, None)
             return False
 
     def natural_language_query(self, utterance: str,

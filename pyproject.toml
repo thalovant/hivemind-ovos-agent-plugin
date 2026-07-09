@@ -21,6 +21,7 @@ dependencies = [
     # (gh-automations only bumps version.py on merge to dev). Tighten
     # to >=0.6.0a1 once #27 is released.
     "hivemind-plugin-manager>=0.5.0,<1.0.0",
+    "pyee>=13.0.1,<13.1.0",
 ]
 
 [project.optional-dependencies]
