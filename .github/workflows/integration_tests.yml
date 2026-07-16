@@ -13,5 +13,5 @@ jobs:
     with:
       python_versions: '["3.11"]'
       system_deps: 'python3-dev swig'
-      pre_install_pip: '"ovoscope" "ovos-core" "ovos-skill-hello-world" "hivemind-plugin-manager==0.7.0a1"'
+      pre_install_pip: '"ovoscope" "ovos-core" "ovos-skill-hello-world"'
       test_path: 'tests/e2e/test_ovos_agent_ovoscope_e2e.py'
