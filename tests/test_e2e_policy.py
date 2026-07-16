@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
 from hivescope.topology import TopologyBuilder
 from ovos_bus_client.message import Message
