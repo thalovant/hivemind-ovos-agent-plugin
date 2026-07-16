@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "hivemind-ovos-agent-plugin"
 dynamic = ["version"]
 description = "OVOS agent protocol plugin for HiveMind-core"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 readme = "README.md"
 authors = [
     { name = "jarbasAi", email = "jarbasai@mailfence.com" }
@@ -21,7 +21,6 @@ dependencies = [
     # (gh-automations only bumps version.py on merge to dev). Tighten
     # to >=0.6.0a1 once #27 is released.
     "hivemind-plugin-manager>=0.5.0,<1.0.0",
-    "pyee>=13.0.1,<13.1.0",
 ]
 
 [project.optional-dependencies]
@@ -55,3 +54,8 @@ version = { attr = "hivemind_ovos_agent_plugin.version.__version__" }
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["hivemind_ovos_agent_plugin*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: exercises a live OVOS skill pipeline",
+]

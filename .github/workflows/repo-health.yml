@@ -1,3 +1,7 @@
+permissions:
+  contents: read
+  pull-requests: write
+
 name: Repo Health
 
 on:
@@ -7,6 +11,7 @@ on:
 
 jobs:
   repo_health:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/repo-health.yml@dev
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    uses: OpenVoiceOS/gh-automations/.github/workflows/repo-health.yml@e1770fb608f8c39ab886ff336f6470ee17747b0d # dev
     with:
       version_file: 'hivemind_ovos_agent_plugin/version.py'

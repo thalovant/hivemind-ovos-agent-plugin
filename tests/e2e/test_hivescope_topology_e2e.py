@@ -18,14 +18,17 @@ reverse-routed to the right satellite by ``handle_internal_mycroft``.
 """
 import pytest
 
-pytest.importorskip("hivescope")
+from hivemind_bus_client.message import HiveMessage, HiveMessageType
+from hivemind_ovos_agent_plugin import OVOSAgentProtocol
+from ovos_bus_client.message import Message
+from ovos_utils.fakebus import FakeBus
 
-from hivemind_bus_client.message import HiveMessage, HiveMessageType  # noqa: E402
-from ovos_bus_client.message import Message  # noqa: E402
-from ovos_utils.fakebus import FakeBus  # noqa: E402
-from hivescope.topology import TopologyBuilder  # noqa: E402
+try:
+    from hivescope.topology import TopologyBuilder
+except ImportError:
+    TopologyBuilder = None
 
-from hivemind_ovos_agent_plugin import OVOSAgentProtocol  # noqa: E402
+pytestmark = pytest.mark.skipif(TopologyBuilder is None, reason="needs hivescope")
 
 
 def _make_agent() -> OVOSAgentProtocol:
@@ -54,6 +57,7 @@ def _fake_skill(agent: OVOSAgentProtocol, answer: str):
 
 
 def _hive(agent: OVOSAgentProtocol) -> TopologyBuilder:
+    assert TopologyBuilder is not None
     b = TopologyBuilder()
     m = b.add_master("M0", agent_protocol=agent)
     m.register_satellite("ovos-key", password="ovos-pw",

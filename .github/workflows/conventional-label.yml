@@ -1,3 +1,8 @@
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 # auto add labels to PRs
 on:
   pull_request_target:
@@ -7,4 +12,4 @@ jobs:
   label:
     runs-on: ubuntu-latest
     steps:
-      - uses: bcoe/conventional-release-labels@v1
+      - uses: bcoe/conventional-release-labels@886f696738527c7be444262c327c89436dfb95a8 # v1

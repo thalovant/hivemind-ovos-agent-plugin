@@ -1,3 +1,9 @@
+permissions:
+  # The pinned reusable workflow declares contents:write for its optional
+  # Pages path; GitHub validates that permission even when Pages is disabled.
+  contents: write
+  pull-requests: write
+
 name: Code Coverage
 
 on:
@@ -7,7 +13,7 @@ on:
 
 jobs:
   coverage:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@dev
+    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@e1770fb608f8c39ab886ff336f6470ee17747b0d # dev
     with:
       python_version: '3.11'
       coverage_source: 'hivemind_ovos_agent_plugin'
@@ -20,3 +26,4 @@ jobs:
       min_coverage: 0
       # hivescope + plugin-manager pinned to released PyPI prereleases;
       pre_install_pip: '"hivescope==0.3.0a1" "hivemind-plugin-manager==0.6.0a1" "hivemind-core==4.3.0a2"'
+      pr_comment: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}

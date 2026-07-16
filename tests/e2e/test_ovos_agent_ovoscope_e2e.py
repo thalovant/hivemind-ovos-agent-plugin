@@ -9,8 +9,6 @@ from importlib.metadata import entry_points
 
 import pytest
 
-pytest.importorskip("ovoscope")
-
 _SKILL = "ovos-skill-hello-world.openvoiceos"
 
 
@@ -21,9 +19,11 @@ def _has_skill():
 @pytest.mark.skipif(not _has_skill(), reason="needs ovos-skill-hello-world")
 @pytest.mark.slow
 def test_ovos_agent_answers_via_real_skill():
-    from ovoscope import get_minicroft
+    ovoscope = pytest.importorskip("ovoscope")
+
     from hivemind_ovos_agent_plugin import OVOSAgentProtocol
-    craft = get_minicroft([_SKILL])
+
+    craft = ovoscope.get_minicroft([_SKILL])
     try:
         # Supply MiniCroft's in-process bus directly. __post_init__ would
         # reconnect to a ws hub on a FakeBus (and hang without one), so build
