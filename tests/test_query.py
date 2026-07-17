@@ -84,6 +84,60 @@ def test_query_accepts_ovos_utterance_speak_alias():
     ]
 
 
+def test_query_waits_for_speak_immediately_after_handled():
+    agent = _agent()
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        context = {
+            "session": {"session_id": query_id},
+            "skill_id": "late.skill",
+        }
+        agent.bus.emit(Message("ovos.utterance.handled", {}, context))
+        agent.bus.emit(Message(
+            "ovos.utterance.speak",
+            {"utterance": "answer after handled"},
+            context,
+        ))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+
+    assert list(agent.natural_language_query("hello", "en-US")) == [
+        "answer after handled",
+        None,
+    ]
+
+
+def test_context_aware_query_preserves_speak_message_provenance():
+    agent = _agent()
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        context = {
+            "session": {"session_id": query_id},
+            "skill_id": "answer.skill",
+        }
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "owned answer"},
+            context,
+        ))
+        agent.bus.emit(Message("ovos.utterance.handled", {}, context))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"], "lang": "en-US"},
+        {"session": {"session_id": "client-session"}},
+    )
+
+    chunks = list(agent.answer_query_message(admitted))
+    assert isinstance(chunks[0], Message)
+    assert chunks[0].data["utterance"] == "owned answer"
+    assert chunks[0].context["skill_id"] == "answer.skill"
+    assert chunks[1] is None
+
+
 def test_answer_query_message_preserves_admitted_context():
     agent = _agent()
     emitted = []
@@ -115,10 +169,10 @@ def test_answer_query_message_preserves_admitted_context():
         },
     )
 
-    assert list(agent.answer_query_message(admitted)) == [
-        "policy-aware answer",
-        None,
-    ]
+    chunks = list(agent.answer_query_message(admitted))
+    assert isinstance(chunks[0], Message)
+    assert chunks[0].data["utterance"] == "policy-aware answer"
+    assert chunks[1] is None
     assert len(emitted) == 1
     query = emitted[0]
     assert query.context["destination"] == "skills"

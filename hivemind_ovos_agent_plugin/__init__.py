@@ -89,7 +89,7 @@ class OVOSAgentProtocol(AgentProtocol):
         yield from self._stream_query(utterance, lang)
 
     def answer_query_message(self, message: Message,
-                             client=None) -> "Iterator[Optional[str]]":
+                             client=None) -> "Iterator[Optional[Any]]":
         """Answer an admitted QUERY while preserving its trusted context.
 
         HiveMind policy plugins annotate the admitted message session with
@@ -109,17 +109,40 @@ class OVOSAgentProtocol(AgentProtocol):
             lang,
             context=message.context,
             bus=self.get_bus(client),
+            preserve_messages=True,
         )
 
     def _stream_query(self, utterance: str, lang: str, *,
                       context: Optional[Dict[str, Any]] = None,
-                      bus=None) -> "Iterator[Optional[str]]":
-        """Collect one OVOS answer using query-id or session correlation."""
+                      bus=None, preserve_messages: bool = False
+                      ) -> "Iterator[Optional[Any]]":
+        """Collect one OVOS answer using query-id or session correlation.
+
+        OVOS skills may emit ``ovos.utterance.handled`` immediately before an
+        asynchronous ``speak``.  Treating ``handled`` as an unconditional end
+        marker loses that valid answer, so an unanswered query gets a short,
+        bounded grace period.  The context-aware HiveMind seam also receives
+        the original speak Message so core can retain safe skill provenance.
+        """
         import queue
+        import time
         import uuid
         qid = uuid.uuid4().hex
         q: "queue.Queue" = queue.Queue()
         query_bus = bus or self.bus
+        config = getattr(self, "config", None)
+        config = config if isinstance(config, dict) else {}
+
+        def _positive_timeout(name, default):
+            try:
+                value = float(config.get(name, default))
+            except (TypeError, ValueError):
+                return default
+            return value if value > 0 else default
+
+        response_timeout = _positive_timeout("query_timeout", 10.0)
+        handled_grace = _positive_timeout("query_handled_grace", 1.0)
+        seen_replies = set()
 
         def _message(value):
             if isinstance(value, str):
@@ -155,9 +178,18 @@ class OVOSAgentProtocol(AgentProtocol):
             msg = _message(msg)
             if msg is None or not _matches_query(msg):
                 return
-            utterance = msg.data.get("utterance", "")
+            data = msg.data if isinstance(msg.data, dict) else {}
+            utterance = data.get("utterance", "")
             if utterance:
-                q.put(("speak", utterance))
+                context = msg.context if isinstance(msg.context, dict) else {}
+                session = context.get("session")
+                session_id = (session.get("session_id")
+                              if isinstance(session, dict) else None)
+                fingerprint = (utterance, context.get("skill_id"), session_id)
+                if fingerprint in seen_replies:
+                    return
+                seen_replies.add(fingerprint)
+                q.put(("speak", msg))
 
         def _on_done(msg):
             if _matches_query(msg):
@@ -175,6 +207,7 @@ class OVOSAgentProtocol(AgentProtocol):
         query_context["query_id"] = qid
 
         query_bus.on("speak", _on_speak)
+        query_bus.on("ovos.utterance.speak", _on_speak)
         query_bus.on("ovos.utterance.handled", _on_done)
         try:
             query_bus.emit(Message(
@@ -182,18 +215,37 @@ class OVOSAgentProtocol(AgentProtocol):
                 {"utterances": [utterance], "lang": lang},
                 query_context,
             ))
+            response_deadline = time.monotonic() + response_timeout
+            handled_deadline = None
+            answered = False
             while True:
+                deadline = response_deadline
+                if handled_deadline is not None:
+                    deadline = min(deadline, handled_deadline)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    yield None
+                    return
                 try:
-                    event, chunk = q.get(timeout=10.0)
+                    event, chunk = q.get(timeout=remaining)
                 except queue.Empty:
                     yield None
                     return
                 if event == "done":
-                    yield None
-                    return
-                yield chunk
+                    if answered:
+                        yield None
+                        return
+                    handled_deadline = time.monotonic() + handled_grace
+                    continue
+                answered = True
+                if preserve_messages:
+                    yield chunk
+                else:
+                    data = chunk.data if isinstance(chunk.data, dict) else {}
+                    yield data.get("utterance", "")
         finally:
             query_bus.remove("speak", _on_speak)
+            query_bus.remove("ovos.utterance.speak", _on_speak)
             query_bus.remove("ovos.utterance.handled", _on_done)
 
     # mycroft handlers - from master -> slave
