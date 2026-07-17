@@ -1,4 +1,5 @@
 import dataclasses
+from copy import deepcopy
 from typing import Dict, Any, Iterator, Optional
 
 from ovos_bus_client import MessageBusClient
@@ -85,50 +86,115 @@ class OVOSAgentProtocol(AgentProtocol):
         """Answer by injecting the utterance on the OVOS bus and streaming the
         ``speak`` replies until ``ovos.utterance.handled`` (or 10s inactivity),
         correlated by a fresh query-scoped session so they are not reverse-routed."""
+        yield from self._stream_query(utterance, lang)
+
+    def answer_query_message(self, message: Message,
+                             client=None) -> "Iterator[Optional[str]]":
+        """Answer an admitted QUERY while preserving its trusted context.
+
+        HiveMind policy plugins annotate the admitted message session with
+        server-side fields such as skill and intent blacklists.  The legacy
+        ``answer_query`` seam only carries text and language, so HiveMind-core
+        calls this optional, richer seam when the agent provides it.
+        """
+        utterances = message.data.get("utterances") or []
+        utterance = utterances[0] if utterances else ""
+        lang = (message.data.get("lang") or message.context.get("lang")
+                or "en-US")
+        if not utterance:
+            yield None
+            return
+        yield from self._stream_query(
+            utterance,
+            lang,
+            context=message.context,
+            bus=self.get_bus(client),
+        )
+
+    def _stream_query(self, utterance: str, lang: str, *,
+                      context: Optional[Dict[str, Any]] = None,
+                      bus=None) -> "Iterator[Optional[str]]":
+        """Collect one OVOS answer using query-id or session correlation."""
         import queue
         import uuid
         qid = uuid.uuid4().hex
         q: "queue.Queue" = queue.Queue()
+        query_bus = bus or self.bus
+
+        def _message(value):
+            if isinstance(value, str):
+                try:
+                    return Message.deserialize(value)
+                except Exception:
+                    return None
+            return value
+
+        def _matches_query(msg):
+            msg = _message(msg)
+            if msg is None:
+                return False
+            msg_context = getattr(msg, "context", None)
+            if isinstance(msg_context, dict):
+                if msg_context.get("query_id") == qid:
+                    return True
+                session = msg_context.get("session")
+                if (isinstance(session, dict)
+                        and session.get("session_id") == qid):
+                    return True
+            data = getattr(msg, "data", None)
+            if isinstance(data, dict):
+                if data.get("query_id") == qid:
+                    return True
+                session = data.get("session")
+                if (isinstance(session, dict)
+                        and session.get("session_id") == qid):
+                    return True
+            return False
 
         def _on_speak(msg):
-            if isinstance(msg, str):
-                try:
-                    msg = Message.deserialize(msg)
-                except Exception:
-                    return
-            if msg.msg_type == "speak" and msg.context.get("query_id") == qid:
-                q.put(msg.data.get("utterance", ""))
+            msg = _message(msg)
+            if msg is None or not _matches_query(msg):
+                return
+            utterance = msg.data.get("utterance", "")
+            if utterance:
+                q.put(("speak", utterance))
 
         def _on_done(msg):
-            if isinstance(msg, str):
-                try:
-                    msg = Message.deserialize(msg)
-                except Exception:
-                    return
-            if msg.context.get("query_id") == qid:
-                q.put(None)
+            if _matches_query(msg):
+                q.put(("done", None))
 
-        self.bus.on("speak", _on_speak)
-        self.bus.on("ovos.utterance.handled", _on_done)
+        query_context = deepcopy(context) if isinstance(context, dict) else {}
+        session = query_context.get("session")
+        if not isinstance(session, dict):
+            session = {}
+        else:
+            session = deepcopy(session)
+        session["session_id"] = qid
+        session.setdefault("lang", lang)
+        query_context["session"] = session
+        query_context["query_id"] = qid
+
+        query_bus.on("speak", _on_speak)
+        query_bus.on("ovos.utterance.handled", _on_done)
         try:
-            self.bus.emit(Message(
+            query_bus.emit(Message(
                 "recognizer_loop:utterance",
                 {"utterances": [utterance], "lang": lang},
-                {"query_id": qid, "session": {"session_id": qid}},
+                query_context,
             ))
             while True:
                 try:
-                    chunk = q.get(timeout=10.0)
+                    event, chunk = q.get(timeout=10.0)
                 except queue.Empty:
                     yield None
                     return
-                if chunk is None:
+                if event == "done":
                     yield None
                     return
                 yield chunk
         finally:
-            self.bus.remove("speak", _on_speak)
-            self.bus.remove("ovos.utterance.handled", _on_done)
+            query_bus.remove("speak", _on_speak)
+            query_bus.remove("ovos.utterance.handled", _on_done)
 
     # mycroft handlers - from master -> slave
     def handle_send(self, message: Message):
