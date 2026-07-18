@@ -1,4 +1,5 @@
 import dataclasses
+import time
 from copy import deepcopy
 from typing import Dict, Any, Iterator, Optional
 
@@ -8,6 +9,8 @@ from ovos_config import Configuration
 from ovos_utils.fakebus import FakeBus
 from ovos_utils.log import LOG
 from pyee import EventEmitter
+from websocket import (WebSocketConnectionClosedException, WebSocketException,
+                       WebSocketTimeoutException)
 
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
 from hivemind_plugin_manager.protocols import AgentProtocol
@@ -33,6 +36,90 @@ __all__ = [
 ]
 
 
+class _RuntimeMessageBusClient(MessageBusClient):
+    """Reconnect quietly while a managed OVOS runtime is being replaced.
+
+    Kubernetes can reject a connection with ``EPERM`` while a Service has no
+    ready endpoints.  That is an expected, bounded condition during a serial
+    runtime rollout, not an application traceback.  Keep retrying at INFO and
+    escalate once when the outage exceeds the configured recovery budget.
+    """
+
+    def __init__(self, *args, reconnect_error_after=120, **kwargs):
+        self._disconnect_started_at = None
+        self._disconnect_escalated = False
+        try:
+            reconnect_error_after = float(reconnect_error_after)
+        except (TypeError, ValueError):
+            reconnect_error_after = 120.0
+        self._reconnect_error_after = max(reconnect_error_after, 1.0)
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _error_from_args(args):
+        return args[0] if len(args) == 1 else args[1]
+
+    @staticmethod
+    def _is_transient_disconnect(error):
+        return isinstance(error, (
+            ConnectionError,
+            PermissionError,
+            TimeoutError,
+            WebSocketConnectionClosedException,
+            WebSocketTimeoutException,
+        ))
+
+    def on_open(self, *args):
+        self._disconnect_started_at = None
+        self._disconnect_escalated = False
+        return super().on_open(*args)
+
+    def on_error(self, *args):
+        error = self._error_from_args(args)
+        if not self._is_transient_disconnect(error):
+            return super().on_error(*args)
+
+        self.connected_event.clear()
+        now = time.monotonic()
+        if self._disconnect_started_at is None:
+            self._disconnect_started_at = now
+        elapsed = now - self._disconnect_started_at
+        if (elapsed >= self._reconnect_error_after
+                and not self._disconnect_escalated):
+            LOG.error(
+                "OVOS message bus remained unavailable for %.1f seconds: %r",
+                elapsed,
+                error,
+            )
+            self._disconnect_escalated = True
+        else:
+            LOG.info(
+                "OVOS message bus is temporarily unavailable; retrying in "
+                "%.1f seconds (%s)",
+                self.retry,
+                type(error).__name__,
+            )
+
+        try:
+            if self.client.keep_running:
+                self.client.close()
+        except Exception as exc:
+            LOG.error(
+                "Exception closing websocket at %s: %s",
+                self.client.url,
+                exc,
+            )
+
+        time.sleep(self.retry)
+        self.retry = min(self.retry * 2, 60)
+        try:
+            self.emitter.emit("reconnecting")
+            self.client = self.create_client()
+            self.run_forever()
+        except WebSocketException:
+            pass
+
+
 @dataclasses.dataclass()
 class OVOSAgentProtocol(AgentProtocol):
     """HiveMind agent protocol that bridges client messages to an OVOS bus."""
@@ -44,10 +131,13 @@ class OVOSAgentProtocol(AgentProtocol):
             ovos_bus_address = self.config.get("host") or "127.0.0.1"
             ovos_bus_port = self.config.get("port") or 8181
             timeout = self.config.get("connection_timeout", 10)
-            self.bus = MessageBusClient(
+            self.bus = _RuntimeMessageBusClient(
                 host=ovos_bus_address,
                 port=ovos_bus_port,
                 emitter=EventEmitter(),
+                reconnect_error_after=self.config.get(
+                    "reconnect_error_after", 120
+                ),
             )
             self.bus.run_in_thread()
             # Fail fast instead of blocking forever: a bare ``connected_event.wait()``
