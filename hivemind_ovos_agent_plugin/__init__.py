@@ -47,6 +47,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
     """
 
     def __init__(self, *args, reconnect_error_after=120, **kwargs):
+        """Initialize bounded reconnect state before creating the bus client."""
         self._disconnect_started_at = None
         self._disconnect_escalated = False
         self._reconnect_state_lock = Lock()
@@ -62,10 +63,12 @@ class _RuntimeMessageBusClient(MessageBusClient):
 
     @staticmethod
     def _error_from_args(args):
+        """Return the websocket error from supported callback signatures."""
         return args[0] if len(args) == 1 else args[1]
 
     @staticmethod
     def _is_transient_disconnect(error):
+        """Return whether an error should enter the bounded reconnect path."""
         return isinstance(error, (
             ConnectionError,
             PermissionError,
@@ -75,11 +78,14 @@ class _RuntimeMessageBusClient(MessageBusClient):
         ))
 
     def on_open(self, *args):
+        """Reset the outage budget after the upstream client reconnects."""
         self._disconnect_started_at = None
         self._disconnect_escalated = False
+        self.retry = 5
         return super().on_open(*args)
 
     def close(self):
+        """Mark an intentional shutdown so close callbacks cannot reconnect."""
         self._ensure_reconnect_state()
         with self._reconnect_state_lock:
             self._close_requested = True
@@ -177,9 +183,11 @@ class _RuntimeMessageBusClient(MessageBusClient):
                 if self._reconnect_error is None:
                     # A mocked or externally stopped run loop returned without
                     # a close/error callback; do not spin indefinitely.
+                    self._reconnect_worker = None
                     return
 
     def on_close(self, *args):
+        """Reconnect when the runtime bus closes its websocket cleanly."""
         super().on_close(*args)
         self._schedule_reconnect(
             WebSocketConnectionClosedException(
@@ -188,6 +196,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
         )
 
     def on_error(self, *args):
+        """Reconnect transient disconnects and preserve other error handling."""
         error = self._error_from_args(args)
         if not self._is_transient_disconnect(error):
             return super().on_error(*args)
