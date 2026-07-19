@@ -1,6 +1,7 @@
 import dataclasses
 import time
 from copy import deepcopy
+from threading import Lock, Thread
 from typing import Dict, Any, Iterator, Optional
 
 from ovos_bus_client import MessageBusClient
@@ -46,8 +47,13 @@ class _RuntimeMessageBusClient(MessageBusClient):
     """
 
     def __init__(self, *args, reconnect_error_after=120, **kwargs):
+        """Initialize bounded reconnect state before creating the bus client."""
         self._disconnect_started_at = None
         self._disconnect_escalated = False
+        self._reconnect_state_lock = Lock()
+        self._reconnect_worker = None
+        self._reconnect_error = None
+        self._close_requested = False
         try:
             reconnect_error_after = float(reconnect_error_after)
         except (TypeError, ValueError):
@@ -57,10 +63,12 @@ class _RuntimeMessageBusClient(MessageBusClient):
 
     @staticmethod
     def _error_from_args(args):
+        """Return the websocket error from supported callback signatures."""
         return args[0] if len(args) == 1 else args[1]
 
     @staticmethod
     def _is_transient_disconnect(error):
+        """Return whether an error should enter the bounded reconnect path."""
         return isinstance(error, (
             ConnectionError,
             PermissionError,
@@ -70,54 +78,129 @@ class _RuntimeMessageBusClient(MessageBusClient):
         ))
 
     def on_open(self, *args):
+        """Reset the outage budget after the upstream client reconnects."""
         self._disconnect_started_at = None
         self._disconnect_escalated = False
+        self.retry = 5
         return super().on_open(*args)
 
+    def close(self):
+        """Mark an intentional shutdown so close callbacks cannot reconnect."""
+        self._ensure_reconnect_state()
+        with self._reconnect_state_lock:
+            self._close_requested = True
+        return super().close()
+
+    def _ensure_reconnect_state(self):
+        """Initialize reconnect state for normal and test-constructed clients."""
+        if not hasattr(self, "_reconnect_state_lock"):
+            self._reconnect_state_lock = Lock()
+            self._reconnect_worker = None
+            self._reconnect_error = None
+            self._close_requested = False
+
+    def _schedule_reconnect(self, error):
+        """Start one durable reconnect worker for error and clean-close paths."""
+        self._ensure_reconnect_state()
+        self.connected_event.clear()
+        with self._reconnect_state_lock:
+            if self._close_requested:
+                return
+            self._reconnect_error = error
+            if (self._reconnect_worker is not None
+                    and self._reconnect_worker.is_alive()):
+                return
+            self._reconnect_worker = Thread(
+                target=self._run_reconnect_loop,
+                name="ovos-runtime-bus-reconnect",
+                daemon=True,
+            )
+            self._reconnect_worker.start()
+
+    def _run_reconnect_loop(self):
+        """Reconnect after every observed close without recursive run loops."""
+        while True:
+            with self._reconnect_state_lock:
+                if self._close_requested:
+                    self._reconnect_worker = None
+                    return
+                error = self._reconnect_error or WebSocketConnectionClosedException(
+                    "OVOS message bus connection closed"
+                )
+                self._reconnect_error = None
+
+            now = time.monotonic()
+            if self._disconnect_started_at is None:
+                self._disconnect_started_at = now
+            elapsed = now - self._disconnect_started_at
+            if (elapsed >= self._reconnect_error_after
+                    and not self._disconnect_escalated):
+                LOG.error(
+                    "OVOS message bus remained unavailable for %.1f seconds: %r",
+                    elapsed,
+                    error,
+                )
+                self._disconnect_escalated = True
+            else:
+                LOG.info(
+                    "OVOS message bus is temporarily unavailable; retrying in "
+                    "%.1f seconds (%s)",
+                    self.retry,
+                    type(error).__name__,
+                )
+
+            try:
+                if self.client.keep_running:
+                    self.client.close()
+            except Exception as exc:
+                LOG.error(
+                    "Exception closing websocket at %s: %s",
+                    self.client.url,
+                    exc,
+                )
+
+            time.sleep(self.retry)
+            self.retry = min(self.retry * 2, 60)
+            with self._reconnect_state_lock:
+                if self._close_requested:
+                    self._reconnect_worker = None
+                    return
+                # Ignore the close callback caused by closing the stale
+                # transport above; only callbacks from the new run matter.
+                self._reconnect_error = None
+            try:
+                self.emitter.emit("reconnecting")
+                self.client = self.create_client()
+                self.run_forever()
+            except WebSocketException as exc:
+                with self._reconnect_state_lock:
+                    self._reconnect_error = exc
+
+            with self._reconnect_state_lock:
+                if self._close_requested:
+                    self._reconnect_worker = None
+                    return
+                if self._reconnect_error is None:
+                    # A mocked or externally stopped run loop returned without
+                    # a close/error callback; do not spin indefinitely.
+                    self._reconnect_worker = None
+                    return
+
+    def on_close(self, *args):
+        """Reconnect when the runtime bus closes its websocket cleanly."""
+        super().on_close(*args)
+        self._schedule_reconnect(
+            WebSocketConnectionClosedException(
+                "OVOS message bus connection closed cleanly"
+            )
+        )
+
     def on_error(self, *args):
+        """Reconnect transient disconnects and preserve other error handling."""
         error = self._error_from_args(args)
         if not self._is_transient_disconnect(error):
             return super().on_error(*args)
-
-        self.connected_event.clear()
-        now = time.monotonic()
-        if self._disconnect_started_at is None:
-            self._disconnect_started_at = now
-        elapsed = now - self._disconnect_started_at
-        if (elapsed >= self._reconnect_error_after
-                and not self._disconnect_escalated):
-            LOG.error(
-                "OVOS message bus remained unavailable for %.1f seconds: %r",
-                elapsed,
-                error,
-            )
-            self._disconnect_escalated = True
-        else:
-            LOG.info(
-                "OVOS message bus is temporarily unavailable; retrying in "
-                "%.1f seconds (%s)",
-                self.retry,
-                type(error).__name__,
-            )
-
-        try:
-            if self.client.keep_running:
-                self.client.close()
-        except Exception as exc:
-            LOG.error(
-                "Exception closing websocket at %s: %s",
-                self.client.url,
-                exc,
-            )
-
-        time.sleep(self.retry)
-        self.retry = min(self.retry * 2, 60)
-        try:
-            self.emitter.emit("reconnecting")
-            self.client = self.create_client()
-            self.run_forever()
-        except WebSocketException:
-            pass
+        self._schedule_reconnect(error)
 
 
 @dataclasses.dataclass()
