@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 from threading import Event
 from unittest.mock import MagicMock
@@ -5,7 +6,11 @@ from unittest.mock import MagicMock
 from websocket import WebSocketConnectionClosedException
 
 import hivemind_ovos_agent_plugin as agent_module
-from hivemind_ovos_agent_plugin import _RuntimeMessageBusClient
+from hivemind_ovos_agent_plugin import (
+    _RuntimeMessageBusClient,
+    _TransientWebsocketDisconnectFilter,
+    _install_websocket_disconnect_log_filter,
+)
 from ovos_bus_client import MessageBusClient
 
 
@@ -190,3 +195,48 @@ def test_explicit_close_does_not_reconnect(monkeypatch):
     parent_close.assert_called_once_with()
     assert client._reconnect_worker is None
     client.create_client.assert_not_called()
+
+
+def test_websocket_filter_downgrades_only_exact_transient_disconnects():
+    """Keep unexpected websocket failures at ERROR for the QA log gate."""
+    filter_ = _TransientWebsocketDisconnectFilter()
+
+    transient = logging.LogRecord(
+        "websocket",
+        logging.ERROR,
+        __file__,
+        1,
+        "[Errno 1] Operation not permitted - goodbye",
+        (),
+        None,
+    )
+    unexpected = logging.LogRecord(
+        "websocket",
+        logging.ERROR,
+        __file__,
+        1,
+        "TLS certificate validation failed - goodbye",
+        (),
+        None,
+    )
+
+    assert filter_.filter(transient) is True
+    assert transient.levelno == logging.INFO
+    assert transient.levelname == "INFO"
+    assert filter_.filter(unexpected) is True
+    assert unexpected.levelno == logging.ERROR
+    assert unexpected.levelname == "ERROR"
+
+
+def test_websocket_filter_installation_is_idempotent(monkeypatch):
+    """Avoid accumulating filters when more than one agent is constructed."""
+    logger = logging.getLogger("websocket")
+    monkeypatch.setattr(logger, "filters", [])
+
+    _install_websocket_disconnect_log_filter()
+    _install_websocket_disconnect_log_filter()
+
+    assert sum(
+        isinstance(item, _TransientWebsocketDisconnectFilter)
+        for item in logger.filters
+    ) == 1
