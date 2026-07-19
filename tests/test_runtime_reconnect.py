@@ -28,6 +28,13 @@ def _client():
     return client
 
 
+def _wait_for_reconnect(client):
+    worker = client._reconnect_worker
+    assert worker is not None
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+
+
 def test_transient_runtime_disconnect_retries_without_warning_or_traceback(
         monkeypatch):
     client = _client()
@@ -38,6 +45,7 @@ def test_transient_runtime_disconnect_retries_without_warning_or_traceback(
     monkeypatch.setattr(agent_module.time, "monotonic", MagicMock(return_value=10))
 
     client.on_error(PermissionError(1, "Operation not permitted"))
+    _wait_for_reconnect(client)
 
     logger.info.assert_called_once()
     logger.warning.assert_not_called()
@@ -59,8 +67,57 @@ def test_closed_connection_uses_the_same_bounded_reconnect_path(monkeypatch):
     monkeypatch.setattr(agent_module.time, "monotonic", MagicMock(return_value=10))
 
     client.on_error(WebSocketConnectionClosedException("closed"))
+    _wait_for_reconnect(client)
 
     logger.info.assert_called_once()
+    logger.warning.assert_not_called()
+    logger.exception.assert_not_called()
+    logger.error.assert_not_called()
+
+
+def test_clean_close_uses_the_same_bounded_reconnect_path(monkeypatch):
+    client = _client()
+    logger = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", logger)
+    monkeypatch.setattr(agent_module.time, "sleep", MagicMock())
+    monkeypatch.setattr(agent_module.time, "monotonic", MagicMock(return_value=10))
+
+    client.on_close(client.client, 1000, "runtime rollout")
+    _wait_for_reconnect(client)
+
+    logger.info.assert_called_once()
+    logger.warning.assert_not_called()
+    logger.exception.assert_not_called()
+    logger.error.assert_not_called()
+    assert not client.connected_event.is_set()
+    client.emitter.emit.assert_any_call("close")
+    client.emitter.emit.assert_any_call("reconnecting")
+    client.create_client.assert_called_once_with()
+    client.run_forever.assert_called_once_with()
+
+
+def test_reconnect_worker_survives_repeated_clean_closes(monkeypatch):
+    client = _client()
+    logger = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", logger)
+    monkeypatch.setattr(agent_module.time, "sleep", MagicMock())
+    monkeypatch.setattr(agent_module.time, "monotonic", MagicMock(return_value=10))
+    reconnects = 0
+
+    def run_forever():
+        nonlocal reconnects
+        reconnects += 1
+        if reconnects == 1:
+            client.on_close(client.client, 1000, "second runtime rollout")
+
+    client.run_forever = MagicMock(side_effect=run_forever)
+
+    client.on_close(client.client, 1000, "first runtime rollout")
+    _wait_for_reconnect(client)
+
+    assert reconnects == 2
+    assert client.create_client.call_count == 2
+    assert logger.info.call_count == 2
     logger.warning.assert_not_called()
     logger.exception.assert_not_called()
     logger.error.assert_not_called()
@@ -75,7 +132,9 @@ def test_transient_disconnect_escalates_once_after_recovery_budget(monkeypatch):
     monkeypatch.setattr(agent_module.time, "monotonic", MagicMock(return_value=131))
 
     client.on_error(PermissionError(1, "Operation not permitted"))
+    _wait_for_reconnect(client)
     client.on_error(PermissionError(1, "Operation not permitted"))
+    _wait_for_reconnect(client)
 
     logger.error.assert_called_once()
     logger.info.assert_called_once()
@@ -105,3 +164,16 @@ def test_unexpected_error_uses_upstream_error_semantics(monkeypatch):
     client.on_error(error)
 
     parent_on_error.assert_called_once_with(error)
+
+
+def test_explicit_close_does_not_reconnect(monkeypatch):
+    client = _client()
+    parent_close = MagicMock()
+    monkeypatch.setattr(MessageBusClient, "close", parent_close)
+
+    client.close()
+    client.on_close(client.client, 1000, "shutdown")
+
+    parent_close.assert_called_once_with()
+    assert client._reconnect_worker is None
+    client.create_client.assert_not_called()
