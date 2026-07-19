@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 import time
 from copy import deepcopy
 from threading import Lock, Thread
@@ -37,6 +38,41 @@ __all__ = [
 ]
 
 
+class _TransientWebsocketDisconnectFilter(logging.Filter):
+    """Downgrade websocket-client's pre-callback rollout noise to INFO.
+
+    ``websocket-client`` logs an unconditional ERROR ending in ``goodbye``
+    after it invokes ``on_error``.  The runtime client owns the bounded
+    reconnect and escalation policy, so the two exact Kubernetes rollout
+    failures must not be reported as independent application errors first.
+    """
+
+    _TRANSIENT_MESSAGES = {
+        "Connection to remote host was lost. - goodbye",
+        "[Errno 1] Operation not permitted - goodbye",
+    }
+
+    def filter(self, record):
+        """Retain every record while lowering only known transient messages."""
+        if (
+            record.levelno >= logging.ERROR
+            and record.getMessage() in self._TRANSIENT_MESSAGES
+        ):
+            record.levelno = logging.INFO
+            record.levelname = logging.getLevelName(logging.INFO)
+        return True
+
+
+def _install_websocket_disconnect_log_filter():
+    """Install the process-wide websocket filter exactly once."""
+    logger = logging.getLogger("websocket")
+    if not any(
+        isinstance(item, _TransientWebsocketDisconnectFilter)
+        for item in logger.filters
+    ):
+        logger.addFilter(_TransientWebsocketDisconnectFilter())
+
+
 class _RuntimeMessageBusClient(MessageBusClient):
     """Reconnect quietly while a managed OVOS runtime is being replaced.
 
@@ -48,6 +84,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
 
     def __init__(self, *args, reconnect_error_after=120, **kwargs):
         """Initialize bounded reconnect state before creating the bus client."""
+        _install_websocket_disconnect_log_filter()
         self._disconnect_started_at = None
         self._disconnect_escalated = False
         self._reconnect_state_lock = Lock()
