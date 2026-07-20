@@ -224,6 +224,43 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     return True
                 self.connected_event.clear()
 
+    @staticmethod
+    def _send_frame_with_timeout(transport, payload, timeout, message_type):
+        """Write one websocket frame without trusting a blocking socket call."""
+        completed = Event()
+        errors = []
+
+        def _write_frame():
+            try:
+                transport.send(payload)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        writer = Thread(
+            target=_write_frame,
+            name="ovos-runtime-frame-write",
+            daemon=True,
+        )
+        writer.start()
+        if not completed.wait(timeout):
+            # Closing the exact websocket that owns the blocked write wakes its
+            # daemon thread and lets the normal reconnect path replace it.
+            websocket = getattr(transport, "sock", None)
+            shutdown = getattr(websocket, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:
+                    pass
+            raise TimeoutError(
+                "OVOS message bus frame write remained blocked while sending "
+                f"{message_type}"
+            )
+        if errors:
+            raise errors[0]
+
     def _send(self, message):
         """Send once, reconnecting a stale runtime socket within a hard bound.
 
@@ -269,7 +306,20 @@ class _RuntimeMessageBusClient(MessageBusClient):
                         f"while sending {message_type}"
                     )
                 lock_acquired = True
-                self.client.send(payload)
+                remaining = deadline - time.monotonic()
+                frame_wait = min(1.0, max(remaining / 2, 0.0))
+                if frame_wait <= 0:
+                    raise TimeoutError(
+                        "OVOS message bus send budget expired while sending "
+                        f"{message_type}"
+                    )
+                transport = self.client
+                self._send_frame_with_timeout(
+                    transport,
+                    payload,
+                    frame_wait,
+                    message_type,
+                )
                 return
             except Exception as exc:
                 if not self._is_transient_disconnect(exc):
