@@ -280,6 +280,50 @@ def test_concurrent_query_frames_are_serialized_on_the_websocket():
     assert max_active == 1
 
 
+def test_stalled_send_serialization_reconnects_and_retries_exact_frame(
+        monkeypatch):
+    """A blocked writer cannot strand every later HiveMind query worker."""
+    client = _client()
+    client._message_send_timeout = 0.1
+    stale = client.client
+    first_entered = Event()
+    release_first = Event()
+    replacement = SimpleNamespace(
+        sock=SimpleNamespace(connected=True),
+        send=MagicMock(),
+    )
+
+    def blocking_send(_payload):
+        first_entered.set()
+        release_first.wait(1)
+
+    stale.send.side_effect = blocking_send
+    first = Thread(target=client._send, args=(Message("first"),))
+    first.start()
+    assert first_entered.wait(0.2)
+
+    reconnect_errors = []
+
+    def reconnect(error):
+        reconnect_errors.append(error)
+        release_first.set()
+        client.connected_event.clear()
+        client.client = replacement
+        client.connected_event.set()
+
+    monkeypatch.setattr(client, "_schedule_reconnect", reconnect)
+    second = Message("second", {"query_id": "query-2"})
+
+    client._send(second)
+    first.join(timeout=1)
+
+    assert not first.is_alive()
+    assert len(reconnect_errors) == 1
+    assert isinstance(reconnect_errors[0], TimeoutError)
+    assert "send serialization remained busy" in str(reconnect_errors[0])
+    replacement.send.assert_called_once_with(second.serialize())
+
+
 def test_send_reconnect_wait_is_hard_bounded(monkeypatch):
     """Never inherit ovos-bus-client's unbounded post-disconnect wait."""
     client = _client()

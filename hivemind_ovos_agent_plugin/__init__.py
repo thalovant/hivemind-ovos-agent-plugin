@@ -250,12 +250,26 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     "OVOS message bus did not reconnect within "
                     f"{self._message_send_timeout:.1f} seconds"
                 ) from last_error
+            lock_acquired = False
             try:
                 # websocket-client does not make the message-level ordering
                 # contract visible here. Serialize all application frames so
                 # concurrent HiveMind query workers cannot interleave sends.
-                with self._send_lock:
-                    self.client.send(payload)
+                # A stuck websocket write must not leave every later query
+                # blocked forever behind this lock. Bound lock acquisition,
+                # replace the stale transport, and retry the exact frame.
+                remaining = deadline - time.monotonic()
+                # Preserve at least half of the end-to-end send budget for
+                # closing the stale path and retrying on its replacement.
+                lock_wait = min(1.0, max(remaining / 2, 0.0))
+                if lock_wait <= 0 or not self._send_lock.acquire(
+                        timeout=lock_wait):
+                    raise TimeoutError(
+                        "OVOS message bus send serialization remained busy "
+                        f"while sending {message_type}"
+                    )
+                lock_acquired = True
+                self.client.send(payload)
                 return
             except Exception as exc:
                 if not self._is_transient_disconnect(exc):
@@ -270,6 +284,9 @@ class _RuntimeMessageBusClient(MessageBusClient):
                 raise ConnectionError(
                     f"OVOS message bus closed while sending {message_type}"
                 ) from exc
+            finally:
+                if lock_acquired:
+                    self._send_lock.release()
 
     def _probe_delivery_once(self, timeout):
         """Prove the OVOS intent service consumed and answered one probe."""
