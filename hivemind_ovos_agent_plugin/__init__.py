@@ -1,13 +1,16 @@
 import dataclasses
 import logging
+import math
 import time
 from copy import deepcopy
-from threading import Lock, Thread
+from threading import Lock, Thread, current_thread
 from typing import Dict, Any, Iterator, Optional
 
 from ovos_bus_client import MessageBusClient
+from ovos_bus_client.client.client import _maybe_encrypt
 from ovos_bus_client.message import Message
 from ovos_config import Configuration
+from ovos_utils import json_dumps
 from ovos_utils.fakebus import FakeBus
 from ovos_utils.log import LOG
 from pyee import EventEmitter
@@ -43,21 +46,26 @@ class _TransientWebsocketDisconnectFilter(logging.Filter):
 
     ``websocket-client`` logs an unconditional ERROR ending in ``goodbye``
     after it invokes ``on_error``.  The runtime client owns the bounded
-    reconnect and escalation policy, so the two exact Kubernetes rollout
+    reconnect and escalation policy, so known transport-level rollout
     failures must not be reported as independent application errors first.
     """
 
-    _TRANSIENT_MESSAGES = {
-        "Connection to remote host was lost. - goodbye",
-        "[Errno 1] Operation not permitted - goodbye",
-    }
+    _TRANSIENT_FRAGMENTS = (
+        "connection to remote host was lost",
+        "operation not permitted",
+        "connection refused",
+        "connection reset by peer",
+        "broken pipe",
+        "timed out",
+    )
 
     def filter(self, record):
         """Retain every record while lowering only known transient messages."""
-        if (
-            record.levelno >= logging.ERROR
-            and record.getMessage() in self._TRANSIENT_MESSAGES
-        ):
+        message = record.getMessage().lower()
+        if (record.levelno >= logging.ERROR
+                and message.endswith("- goodbye")
+                and any(item in message
+                        for item in self._TRANSIENT_FRAGMENTS)):
             record.levelno = logging.INFO
             record.levelname = logging.getLevelName(logging.INFO)
         return True
@@ -82,7 +90,9 @@ class _RuntimeMessageBusClient(MessageBusClient):
     escalate once when the outage exceeds the configured recovery budget.
     """
 
-    def __init__(self, *args, reconnect_error_after=120, **kwargs):
+    def __init__(self, *args, reconnect_error_after=120,
+                 message_send_timeout=15, ping_interval=15,
+                 ping_timeout=5, **kwargs):
         """Initialize bounded reconnect state before creating the bus client."""
         _install_websocket_disconnect_log_filter()
         self._disconnect_started_at = None
@@ -96,7 +106,23 @@ class _RuntimeMessageBusClient(MessageBusClient):
         except (TypeError, ValueError):
             reconnect_error_after = 120.0
         self._reconnect_error_after = max(reconnect_error_after, 1.0)
+        self._message_send_timeout = self._positive_float(
+            message_send_timeout, 15.0
+        )
+        self._ping_interval = self._positive_float(ping_interval, 15.0)
+        self._ping_timeout = self._positive_float(ping_timeout, 5.0)
+        if self._ping_timeout >= self._ping_interval:
+            self._ping_timeout = max(1.0, self._ping_interval / 2)
         super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _positive_float(value, default):
+        """Return a finite positive float suitable for timeout settings."""
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if math.isfinite(parsed) and parsed > 0 else default
 
     @staticmethod
     def _error_from_args(args):
@@ -139,20 +165,110 @@ class _RuntimeMessageBusClient(MessageBusClient):
     def _schedule_reconnect(self, error):
         """Start one durable reconnect worker for error and clean-close paths."""
         self._ensure_reconnect_state()
+        was_connected = self.connected_event.is_set()
         self.connected_event.clear()
+        wake_worker = False
         with self._reconnect_state_lock:
             if self._close_requested:
                 return
             self._reconnect_error = error
             if (self._reconnect_worker is not None
                     and self._reconnect_worker.is_alive()):
-                return
-            self._reconnect_worker = Thread(
-                target=self._run_reconnect_loop,
-                name="ovos-runtime-bus-reconnect",
-                daemon=True,
+                # After its first successful reconnect the supervisor is
+                # blocked inside WebSocketApp.run_forever().  A send from a
+                # query thread may be the first code to notice a half-open
+                # socket, so close that stale transport to wake the existing
+                # supervisor instead of leaving it unable to consume the new
+                # reconnect request.
+                wake_worker = (
+                    was_connected
+                    and self._reconnect_worker is not current_thread()
+                )
+            else:
+                self._reconnect_worker = Thread(
+                    target=self._run_reconnect_loop,
+                    name="ovos-runtime-bus-reconnect",
+                    daemon=True,
+                )
+                self._reconnect_worker.start()
+        if wake_worker:
+            try:
+                self.client.close()
+            except Exception as exc:
+                LOG.info("Could not close stale OVOS bus transport: %s", exc)
+
+    def _transport_is_open(self):
+        """Return whether websocket-client still has a live transport."""
+        sock = getattr(self.client, "sock", None)
+        return bool(sock is not None and getattr(sock, "connected", False))
+
+    def _wait_for_live_transport(self, deadline):
+        """Bound reconnection waits so a query worker can never block forever."""
+        if self.connected_event.is_set() and self._transport_is_open():
+            return True
+        self._schedule_reconnect(
+            WebSocketConnectionClosedException(
+                "OVOS message bus transport is not connected"
             )
-            self._reconnect_worker.start()
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self.connected_event.wait(min(remaining, 0.25)):
+                if self._transport_is_open():
+                    return True
+                self.connected_event.clear()
+
+    def _send(self, message):
+        """Send once, reconnecting a stale runtime socket within a hard bound.
+
+        ``ovos-bus-client`` waits without a timeout after its initial ten
+        seconds and swallows ``WebSocketConnectionClosedException``.  In a
+        HiveMind query pool that strands one worker per request indefinitely.
+        Keep the wire representation identical while making availability and
+        delivery failures explicit and retrying one frame after reconnection.
+        """
+        if hasattr(message, "serialize"):
+            payload = message.serialize()
+            message_type = getattr(message, "msg_type", "message")
+        else:
+            payload = json_dumps(message.__dict__)
+            message_type = type(message).__name__
+        payload = _maybe_encrypt(payload)
+        deadline = time.monotonic() + self._message_send_timeout
+        last_error = None
+
+        for attempt in range(2):
+            if not self._wait_for_live_transport(deadline):
+                raise TimeoutError(
+                    "OVOS message bus did not reconnect within "
+                    f"{self._message_send_timeout:.1f} seconds"
+                ) from last_error
+            try:
+                self.client.send(payload)
+                return
+            except Exception as exc:
+                if not self._is_transient_disconnect(exc):
+                    LOG.exception(
+                        "Failed to emit OVOS message %s", message_type
+                    )
+                    raise
+                last_error = exc
+                self._schedule_reconnect(exc)
+                if attempt == 0:
+                    continue
+                raise ConnectionError(
+                    f"OVOS message bus closed while sending {message_type}"
+                ) from exc
+
+    def run_forever(self):
+        """Run with ping/pong liveness so half-open sockets are bounded."""
+        self.started_running = True
+        return self.client.run_forever(
+            ping_interval=self._ping_interval,
+            ping_timeout=self._ping_timeout,
+        )
 
     def _run_reconnect_loop(self):
         """Reconnect after every observed close without recursive run loops."""
@@ -258,6 +374,11 @@ class OVOSAgentProtocol(AgentProtocol):
                 reconnect_error_after=self.config.get(
                     "reconnect_error_after", 120
                 ),
+                message_send_timeout=self.config.get(
+                    "message_send_timeout", 15
+                ),
+                ping_interval=self.config.get("ping_interval", 15),
+                ping_timeout=self.config.get("ping_timeout", 5),
             )
             self.bus.run_in_thread()
             # Fail fast instead of blocking forever: a bare ``connected_event.wait()``
