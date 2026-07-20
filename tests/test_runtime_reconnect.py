@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from threading import Event
 from unittest.mock import MagicMock
 
+import pytest
 from websocket import WebSocketConnectionClosedException
 
 import hivemind_ovos_agent_plugin as agent_module
@@ -12,6 +13,7 @@ from hivemind_ovos_agent_plugin import (
     _install_websocket_disconnect_log_filter,
 )
 from ovos_bus_client import MessageBusClient
+from ovos_bus_client.message import Message
 
 
 def _client():
@@ -20,12 +22,18 @@ def _client():
     client._disconnect_started_at = None
     client._disconnect_escalated = False
     client._reconnect_error_after = 120.0
+    client._message_send_timeout = 0.05
+    client._ping_interval = 15.0
+    client._ping_timeout = 5.0
     client.retry = 5
     client.connected_event = Event()
     client.connected_event.set()
     client.client = SimpleNamespace(
         keep_running=True,
         close=MagicMock(),
+        run_forever=MagicMock(),
+        send=MagicMock(),
+        sock=SimpleNamespace(connected=True),
         url="ws://runtime:8181",
     )
     client.emitter = MagicMock()
@@ -171,6 +179,79 @@ def test_successful_connection_resets_disconnect_budget(monkeypatch):
     parent_on_open.assert_called_once_with("socket")
 
 
+def test_run_forever_enables_websocket_heartbeat():
+    """Detect a half-open runtime socket instead of waiting for a later send."""
+    client = _client()
+
+    _RuntimeMessageBusClient.run_forever(client)
+
+    client.client.run_forever.assert_called_once_with(
+        ping_interval=15.0,
+        ping_timeout=5.0,
+    )
+    assert client.started_running is True
+
+
+def test_send_recovers_a_stale_transport_without_leaking_worker(monkeypatch):
+    """Wake the reconnect path and retry on the replacement websocket."""
+    client = _client()
+    stale = client.client
+    stale.sock.connected = False
+    replacement = SimpleNamespace(
+        sock=SimpleNamespace(connected=True),
+        send=MagicMock(),
+    )
+
+    def reconnect(_error):
+        client.connected_event.clear()
+        client.client = replacement
+        client.connected_event.set()
+
+    monkeypatch.setattr(client, "_schedule_reconnect", reconnect)
+
+    client._send(Message("recognizer_loop:utterance", {"utterances": ["hi"]}))
+
+    stale.send.assert_not_called()
+    replacement.send.assert_called_once()
+
+
+def test_closed_send_reconnects_and_retries_exact_frame(monkeypatch):
+    """A send-detected close gets one bounded retry on the fresh socket."""
+    client = _client()
+    stale = client.client
+    stale.send.side_effect = WebSocketConnectionClosedException("closed")
+    replacement = SimpleNamespace(
+        sock=SimpleNamespace(connected=True),
+        send=MagicMock(),
+    )
+
+    def reconnect(_error):
+        client.connected_event.clear()
+        client.client = replacement
+        client.connected_event.set()
+
+    monkeypatch.setattr(client, "_schedule_reconnect", reconnect)
+    message = Message("recognizer_loop:utterance", {"utterances": ["hi"]})
+
+    client._send(message)
+
+    stale.send.assert_called_once()
+    replacement.send.assert_called_once_with(stale.send.call_args.args[0])
+
+
+def test_send_reconnect_wait_is_hard_bounded(monkeypatch):
+    """Never inherit ovos-bus-client's unbounded post-disconnect wait."""
+    client = _client()
+    client.client.sock.connected = False
+    client.connected_event.clear()
+    monkeypatch.setattr(client, "_schedule_reconnect", MagicMock())
+
+    with pytest.raises(TimeoutError, match="did not reconnect"):
+        client._send(Message("recognizer_loop:utterance", {}))
+
+    client.client.send.assert_not_called()
+
+
 def test_unexpected_error_uses_upstream_error_semantics(monkeypatch):
     """Delegate non-transient errors to the upstream bus client."""
     client = _client()
@@ -210,6 +291,15 @@ def test_websocket_filter_downgrades_only_exact_transient_disconnects():
         (),
         None,
     )
+    refused = logging.LogRecord(
+        "websocket",
+        logging.ERROR,
+        __file__,
+        1,
+        "[Errno 111] Connection refused - goodbye",
+        (),
+        None,
+    )
     unexpected = logging.LogRecord(
         "websocket",
         logging.ERROR,
@@ -223,6 +313,9 @@ def test_websocket_filter_downgrades_only_exact_transient_disconnects():
     assert filter_.filter(transient) is True
     assert transient.levelno == logging.INFO
     assert transient.levelname == "INFO"
+    assert filter_.filter(refused) is True
+    assert refused.levelno == logging.INFO
+    assert refused.levelname == "INFO"
     assert filter_.filter(unexpected) is True
     assert unexpected.levelno == logging.ERROR
     assert unexpected.levelname == "ERROR"

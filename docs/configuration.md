@@ -19,6 +19,9 @@ The plugin is configured by the `hivemind-core` `agent_protocol` block.
 |--------|--------|----------------|-----------------------------------------------------|
 | `host` | string | `127.0.0.1`    | Hostname or IP of the OVOS messagebus.              |
 | `port` | int    | `8181`         | TCP port of the OVOS messagebus.                    |
+| `message_send_timeout` | number | `15` | Maximum seconds a send may wait for runtime-bus reconnection. |
+| `ping_interval` | number | `15` | WebSocket ping interval used to detect half-open runtime connections. |
+| `ping_timeout` | number | `5` | Seconds to wait for a runtime-bus pong; must be below `ping_interval`. |
 
 If no `host`/`port` are supplied, the plugin falls back to the
 `websocket` section of the global OVOS `Configuration()`, which is also the standard
