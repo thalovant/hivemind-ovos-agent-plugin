@@ -1,6 +1,7 @@
 import logging
+import time
 from types import SimpleNamespace
-from threading import Event
+from threading import Event, Lock, Thread
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -241,6 +242,44 @@ def test_closed_send_reconnects_and_retries_exact_frame(monkeypatch):
     replacement.send.assert_called_once_with(stale.send.call_args.args[0])
 
 
+def test_concurrent_query_frames_are_serialized_on_the_websocket():
+    """Two HiveMind workers must never overlap websocket message writes."""
+    client = _client()
+    first_entered = Event()
+    release_first = Event()
+    state_lock = Lock()
+    active = 0
+    max_active = 0
+
+    def blocking_send(_payload):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active == 1:
+                first_entered.set()
+        release_first.wait(0.5)
+        with state_lock:
+            active -= 1
+
+    client.client.send.side_effect = blocking_send
+    first = Thread(target=client._send, args=(Message("first"),))
+    second = Thread(target=client._send, args=(Message("second"),))
+
+    first.start()
+    assert first_entered.wait(0.2)
+    second.start()
+    time.sleep(0.02)
+    assert max_active == 1
+    release_first.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert max_active == 1
+
+
 def test_send_reconnect_wait_is_hard_bounded(monkeypatch):
     """Never inherit ovos-bus-client's unbounded post-disconnect wait."""
     client = _client()
@@ -254,19 +293,117 @@ def test_send_reconnect_wait_is_hard_bounded(monkeypatch):
     client.client.send.assert_not_called()
 
 
-def test_delivery_probe_accepts_only_its_exact_bus_echo():
-    """Prove liveness with a broker round trip, not a local socket flag."""
+def test_delivery_probe_accepts_only_intent_service_response():
+    """Prove liveness with an application response, not a broker self-echo."""
     client = _client()
     client.emitter = EventEmitter()
 
-    def echo(payload):
+    def respond(payload):
         message = Message.deserialize(payload)
         client.emitter.emit(message.msg_type, message)
+        client.emitter.emit(
+            "thalovant.runtime.probe.response",
+            message.reply(
+                "thalovant.runtime.probe.response",
+                {"probe_id": message.data["probe_id"]},
+            ),
+        )
 
-    client.client.send.side_effect = echo
+    client.client.send.side_effect = respond
 
     assert client._probe_delivery_once(0.05) is True
     assert client.client.send.call_count == 1
+
+
+def test_delivery_probe_rejects_broker_self_echo_without_runtime_response():
+    """A healthy broker alone cannot certify the OVOS application consumer."""
+    client = _client()
+    client.emitter = EventEmitter()
+
+    def echo_only(payload):
+        message = Message.deserialize(payload)
+        client.emitter.emit(message.msg_type, message)
+
+    client.client.send.side_effect = echo_only
+
+    assert client._probe_delivery_once(0.01) is False
+
+
+def test_confirmed_query_accepts_exact_runtime_receipt():
+    """Return only after the intent service acknowledges this query ID."""
+    client = _client()
+    client.emitter = EventEmitter()
+    message = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"query_id": "query-1"},
+    )
+
+    def acknowledge(payload):
+        request = Message.deserialize(payload)
+        if request.msg_type == "thalovant.runtime.query.prepare":
+            response_type = "thalovant.runtime.query.prepared"
+        else:
+            response_type = "thalovant.runtime.query.accepted"
+        client.emitter.emit(
+            response_type,
+            request.reply(
+                response_type,
+                {"query_id": "query-1", "duplicate": False},
+            ),
+        )
+
+    client.client.send.side_effect = acknowledge
+
+    client.emit_confirmed(message, 0.05)
+
+    assert client.client.send.call_count == 2
+
+
+def test_confirmed_query_reconnects_and_retries_the_exact_message(monkeypatch):
+    """One missing receipt reconnects and retries the idempotent query frame."""
+    client = _client()
+    client.emitter = EventEmitter()
+    message = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"query_id": "query-1"},
+    )
+    payloads = []
+
+    def acknowledge_second(payload):
+        request = Message.deserialize(payload)
+        if request.msg_type == "thalovant.runtime.query.prepare":
+            client.emitter.emit(
+                "thalovant.runtime.query.prepared",
+                request.reply(
+                    "thalovant.runtime.query.prepared",
+                    {"query_id": "query-1"},
+                ),
+            )
+            return
+        if request.msg_type != "recognizer_loop:utterance":
+            return
+        payloads.append(payload)
+        if len(payloads) == 2:
+            client.emitter.emit(
+                "thalovant.runtime.query.accepted",
+                request.reply(
+                    "thalovant.runtime.query.accepted",
+                    {"query_id": "query-1", "duplicate": True},
+                ),
+            )
+
+    client.client.send.side_effect = acknowledge_second
+    monkeypatch.setattr(client, "_schedule_reconnect", MagicMock())
+    monkeypatch.setattr(
+        client, "_wait_for_live_transport", MagicMock(return_value=True)
+    )
+
+    client.emit_confirmed(message, 0.01)
+
+    assert payloads[0] == payloads[1]
+    client._schedule_reconnect.assert_called_once()
 
 
 def test_delivery_probe_reconnects_before_any_user_message(monkeypatch):
@@ -297,7 +434,7 @@ def test_delivery_probe_fails_bounded_after_fresh_path_is_silent(monkeypatch):
         return_value=True
     ))
 
-    with pytest.raises(TimeoutError, match="did not echo"):
+    with pytest.raises(TimeoutError, match="did not answer"):
         client.ensure_delivery_path(0.01)
 
     assert client._schedule_reconnect.call_count == 2

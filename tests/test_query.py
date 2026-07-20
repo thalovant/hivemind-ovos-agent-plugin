@@ -188,12 +188,18 @@ def test_answer_query_message_preserves_admitted_context():
 
 
 def test_runtime_delivery_probe_precedes_user_utterance():
-    """Do not emit an intent until the managed runtime path is proven live."""
+    """Require both runtime liveness and receipt before waiting for an answer."""
     agent = _agent()
     order = []
     agent.bus.ensure_delivery_path = MagicMock(
         side_effect=lambda timeout: order.append(("probe", timeout))
     )
+
+    def emit_confirmed(message, timeout):
+        order.append(("accept", timeout))
+        agent.bus.emit(message)
+
+    agent.bus.emit_confirmed = MagicMock(side_effect=emit_confirmed)
 
     def responder(request):
         order.append(("utterance", request.data["utterances"][0]))
@@ -209,4 +215,8 @@ def test_runtime_delivery_probe_precedes_user_utterance():
     assert list(agent.natural_language_query("hello", "en-US")) == [
         "ready", None,
     ]
-    assert order == [("probe", 2.0), ("utterance", "hello")]
+    assert order == [
+        ("probe", 2.0),
+        ("accept", 2.0),
+        ("utterance", "hello"),
+    ]
