@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 from hivemind_ovos_agent_plugin import OVOSAgentProtocol
 from ovos_bus_client.message import Message
 from ovos_utils.fakebus import FakeBus
@@ -183,3 +185,28 @@ def test_answer_query_message_preserves_admitted_context():
     assert query.context["session"]["session_id"] == query.context["query_id"]
     assert query.context["session"]["session_id"] != "original-session"
     assert admitted.context["session"]["session_id"] == "original-session"
+
+
+def test_runtime_delivery_probe_precedes_user_utterance():
+    """Do not emit an intent until the managed runtime path is proven live."""
+    agent = _agent()
+    order = []
+    agent.bus.ensure_delivery_path = MagicMock(
+        side_effect=lambda timeout: order.append(("probe", timeout))
+    )
+
+    def responder(request):
+        order.append(("utterance", request.data["utterances"][0]))
+        query_id = request.context["query_id"]
+        context = {"session": {"session_id": query_id}}
+        agent.bus.emit(Message(
+            "speak", {"utterance": "ready"}, context
+        ))
+        agent.bus.emit(Message("ovos.utterance.handled", {}, context))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+
+    assert list(agent.natural_language_query("hello", "en-US")) == [
+        "ready", None,
+    ]
+    assert order == [("probe", 2.0), ("utterance", "hello")]

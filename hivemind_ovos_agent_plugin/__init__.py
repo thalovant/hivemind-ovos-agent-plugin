@@ -2,8 +2,9 @@ import dataclasses
 import logging
 import math
 import time
+import uuid
 from copy import deepcopy
-from threading import Lock, Thread, current_thread
+from threading import Event, Lock, Thread, current_thread
 from typing import Dict, Any, Iterator, Optional
 
 from ovos_bus_client import MessageBusClient
@@ -262,6 +263,70 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     f"OVOS message bus closed while sending {message_type}"
                 ) from exc
 
+    def _probe_delivery_once(self, timeout):
+        """Prove one message completed a round trip through the runtime bus.
+
+        The OVOS bus broadcasts every accepted message back to the sender.
+        Waiting for a uniquely typed, side-effect-free probe therefore detects
+        a half-open path that still accepts websocket writes but no longer
+        delivers them to the runtime.
+        """
+        probe_id = uuid.uuid4().hex
+        probe_type = f"thalovant.runtime_bus.probe.{probe_id}"
+        received = Event()
+
+        def _on_probe(message):
+            if (isinstance(message, Message)
+                    and isinstance(message.data, dict)
+                    and message.data.get("probe_id") == probe_id):
+                received.set()
+
+        self.emitter.on(probe_type, _on_probe)
+        try:
+            self.emit(Message(probe_type, {"probe_id": probe_id}))
+            return received.wait(timeout)
+        finally:
+            try:
+                self.emitter.remove_listener(probe_type, _on_probe)
+            except (KeyError, ValueError):
+                pass
+
+    def ensure_delivery_path(self, probe_timeout=2):
+        """Reconnect a half-open bus before emitting a user utterance.
+
+        A websocket can remain locally ``connected`` after a Kubernetes
+        endpoint replacement while writes disappear into the retired path.
+        Transport ping/pong and send exceptions cannot prove application
+        delivery in that state.  Probe the broker first, replace the path once
+        on failure, and fail within the existing send deadline if the fresh
+        path also cannot echo a harmless message.
+        """
+        timeout = self._positive_float(probe_timeout, 2.0)
+        last_error = None
+        for attempt in range(2):
+            if self._probe_delivery_once(timeout):
+                return
+
+            last_error = TimeoutError(
+                "OVOS message bus did not echo the delivery probe within "
+                f"{timeout:.1f} seconds"
+            )
+            self._schedule_reconnect(last_error)
+            if attempt == 0:
+                LOG.info(
+                    "OVOS message bus delivery path is stale; reconnecting "
+                    "before the user utterance"
+                )
+                deadline = time.monotonic() + self._message_send_timeout
+                if self._wait_for_live_transport(deadline):
+                    continue
+                last_error = TimeoutError(
+                    "OVOS message bus delivery path did not reconnect within "
+                    f"{self._message_send_timeout:.1f} seconds"
+                )
+            LOG.error("%s", last_error)
+            raise last_error
+
     def run_forever(self):
         """Run with ping/pong liveness so half-open sockets are bounded."""
         self.started_running = True
@@ -473,6 +538,9 @@ class OVOSAgentProtocol(AgentProtocol):
 
         response_timeout = _positive_timeout("query_timeout", 10.0)
         handled_grace = _positive_timeout("query_handled_grace", 1.0)
+        delivery_probe_timeout = _positive_timeout(
+            "delivery_probe_timeout", 2.0
+        )
         seen_replies = set()
 
         def _message(value):
@@ -541,6 +609,11 @@ class OVOSAgentProtocol(AgentProtocol):
         query_bus.on("ovos.utterance.speak", _on_speak)
         query_bus.on("ovos.utterance.handled", _on_done)
         try:
+            ensure_delivery_path = getattr(
+                query_bus, "ensure_delivery_path", None
+            )
+            if callable(ensure_delivery_path):
+                ensure_delivery_path(delivery_probe_timeout)
             query_bus.emit(Message(
                 "recognizer_loop:utterance",
                 {"utterances": [utterance], "lang": lang},

@@ -1,7 +1,7 @@
 import logging
 from types import SimpleNamespace
 from threading import Event
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 from websocket import WebSocketConnectionClosedException
@@ -12,6 +12,7 @@ from hivemind_ovos_agent_plugin import (
     _TransientWebsocketDisconnectFilter,
     _install_websocket_disconnect_log_filter,
 )
+from pyee import EventEmitter
 from ovos_bus_client import MessageBusClient
 from ovos_bus_client.message import Message
 
@@ -25,6 +26,7 @@ def _client():
     client._message_send_timeout = 0.05
     client._ping_interval = 15.0
     client._ping_timeout = 5.0
+    client.session_id = "runtime-probe-test"
     client.retry = 5
     client.connected_event = Event()
     client.connected_event.set()
@@ -250,6 +252,55 @@ def test_send_reconnect_wait_is_hard_bounded(monkeypatch):
         client._send(Message("recognizer_loop:utterance", {}))
 
     client.client.send.assert_not_called()
+
+
+def test_delivery_probe_accepts_only_its_exact_bus_echo():
+    """Prove liveness with a broker round trip, not a local socket flag."""
+    client = _client()
+    client.emitter = EventEmitter()
+
+    def echo(payload):
+        message = Message.deserialize(payload)
+        client.emitter.emit(message.msg_type, message)
+
+    client.client.send.side_effect = echo
+
+    assert client._probe_delivery_once(0.05) is True
+    assert client.client.send.call_count == 1
+
+
+def test_delivery_probe_reconnects_before_any_user_message(monkeypatch):
+    """Replace a silent half-open path, then accept the fresh bus echo."""
+    client = _client()
+    probe = MagicMock(side_effect=[False, True])
+    reconnect = MagicMock()
+    monkeypatch.setattr(client, "_probe_delivery_once", probe)
+    monkeypatch.setattr(client, "_schedule_reconnect", reconnect)
+    monkeypatch.setattr(client, "_wait_for_live_transport", MagicMock(
+        return_value=True
+    ))
+
+    client.ensure_delivery_path(0.01)
+
+    assert probe.call_args_list == [call(0.01), call(0.01)]
+    reconnect.assert_called_once()
+
+
+def test_delivery_probe_fails_bounded_after_fresh_path_is_silent(monkeypatch):
+    """Never send a user utterance when both delivery checks are blackholed."""
+    client = _client()
+    monkeypatch.setattr(
+        client, "_probe_delivery_once", MagicMock(return_value=False)
+    )
+    monkeypatch.setattr(client, "_schedule_reconnect", MagicMock())
+    monkeypatch.setattr(client, "_wait_for_live_transport", MagicMock(
+        return_value=True
+    ))
+
+    with pytest.raises(TimeoutError, match="did not echo"):
+        client.ensure_delivery_path(0.01)
+
+    assert client._schedule_reconnect.call_count == 2
 
 
 def test_unexpected_error_uses_upstream_error_semantics(monkeypatch):
