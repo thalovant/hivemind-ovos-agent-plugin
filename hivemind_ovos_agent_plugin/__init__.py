@@ -99,6 +99,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
         self._disconnect_started_at = None
         self._disconnect_escalated = False
         self._reconnect_state_lock = Lock()
+        self._send_lock = Lock()
         self._reconnect_worker = None
         self._reconnect_error = None
         self._close_requested = False
@@ -162,6 +163,8 @@ class _RuntimeMessageBusClient(MessageBusClient):
             self._reconnect_worker = None
             self._reconnect_error = None
             self._close_requested = False
+        if not hasattr(self, "_send_lock"):
+            self._send_lock = Lock()
 
     def _schedule_reconnect(self, error):
         """Start one durable reconnect worker for error and clean-close paths."""
@@ -230,6 +233,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
         Keep the wire representation identical while making availability and
         delivery failures explicit and retrying one frame after reconnection.
         """
+        self._ensure_reconnect_state()
         if hasattr(message, "serialize"):
             payload = message.serialize()
             message_type = getattr(message, "msg_type", "message")
@@ -247,7 +251,11 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     f"{self._message_send_timeout:.1f} seconds"
                 ) from last_error
             try:
-                self.client.send(payload)
+                # websocket-client does not make the message-level ordering
+                # contract visible here. Serialize all application frames so
+                # concurrent HiveMind query workers cannot interleave sends.
+                with self._send_lock:
+                    self.client.send(payload)
                 return
             except Exception as exc:
                 if not self._is_transient_disconnect(exc):
@@ -264,15 +272,10 @@ class _RuntimeMessageBusClient(MessageBusClient):
                 ) from exc
 
     def _probe_delivery_once(self, timeout):
-        """Prove one message completed a round trip through the runtime bus.
-
-        The OVOS bus broadcasts every accepted message back to the sender.
-        Waiting for a uniquely typed, side-effect-free probe therefore detects
-        a half-open path that still accepts websocket writes but no longer
-        delivers them to the runtime.
-        """
+        """Prove the OVOS intent service consumed and answered one probe."""
         probe_id = uuid.uuid4().hex
-        probe_type = f"thalovant.runtime_bus.probe.{probe_id}"
+        probe_type = "thalovant.runtime.probe"
+        response_type = "thalovant.runtime.probe.response"
         received = Event()
 
         def _on_probe(message):
@@ -281,25 +284,90 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     and message.data.get("probe_id") == probe_id):
                 received.set()
 
-        self.emitter.on(probe_type, _on_probe)
+        self.emitter.on(response_type, _on_probe)
         try:
             self.emit(Message(probe_type, {"probe_id": probe_id}))
             return received.wait(timeout)
         finally:
             try:
-                self.emitter.remove_listener(probe_type, _on_probe)
+                self.emitter.remove_listener(response_type, _on_probe)
             except (KeyError, ValueError):
                 pass
+
+    def emit_confirmed(self, message, acceptance_timeout=2):
+        """Deliver one query with an intent-service receipt and exact retry.
+
+        Reserve ``query_id`` without a side effect, then require the runtime to
+        acknowledge the exact utterance before intent matching. If a frame or
+        receipt is lost, reconnect once and repeat that idempotent stage.
+        """
+        context = message.context if isinstance(message.context, dict) else {}
+        query_id = context.get("query_id")
+        if not isinstance(query_id, str) or not query_id:
+            raise ValueError("confirmed OVOS query requires a non-empty query_id")
+
+        timeout = self._positive_float(acceptance_timeout, 2.0)
+        prepare = Message(
+            "thalovant.runtime.query.prepare", {"query_id": query_id}
+        )
+        stages = (
+            (prepare, "thalovant.runtime.query.prepared", "reservation"),
+            (message, "thalovant.runtime.query.accepted", "acceptance"),
+        )
+
+        for request, response_type, stage in stages:
+            received = Event()
+
+            def _on_receipt(response):
+                if (isinstance(response, Message)
+                        and isinstance(response.data, dict)
+                        and response.data.get("query_id") == query_id):
+                    received.set()
+
+            self.emitter.on(response_type, _on_receipt)
+            try:
+                for attempt in range(2):
+                    received.clear()
+                    self.emit(request)
+                    if received.wait(timeout):
+                        break
+
+                    last_error = TimeoutError(
+                        "OVOS intent service did not confirm query "
+                        f"{stage} for {query_id} within {timeout:.1f} seconds"
+                    )
+                    self._schedule_reconnect(last_error)
+                    if attempt == 0:
+                        LOG.info(
+                            "OVOS intent-service query %s receipt was not "
+                            "observed; reconnecting and retrying the exact "
+                            "frame",
+                            stage,
+                        )
+                        deadline = time.monotonic() + self._message_send_timeout
+                        if self._wait_for_live_transport(deadline):
+                            continue
+                        last_error = TimeoutError(
+                            "OVOS message bus did not reconnect before the "
+                            f"exact query {stage} retry"
+                        )
+                    LOG.error("%s", last_error)
+                    raise last_error
+            finally:
+                try:
+                    self.emitter.remove_listener(response_type, _on_receipt)
+                except (KeyError, ValueError):
+                    pass
 
     def ensure_delivery_path(self, probe_timeout=2):
         """Reconnect a half-open bus before emitting a user utterance.
 
         A websocket can remain locally ``connected`` after a Kubernetes
         endpoint replacement while writes disappear into the retired path.
-        Transport ping/pong and send exceptions cannot prove application
-        delivery in that state.  Probe the broker first, replace the path once
-        on failure, and fail within the existing send deadline if the fresh
-        path also cannot echo a harmless message.
+        Transport ping/pong, broker self-echo, and send exceptions cannot prove
+        that the intent service consumes frames. Probe the application first,
+        replace the path once on failure, and require a response from the fresh
+        path before the user utterance.
         """
         timeout = self._positive_float(probe_timeout, 2.0)
         last_error = None
@@ -308,7 +376,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
                 return
 
             last_error = TimeoutError(
-                "OVOS message bus did not echo the delivery probe within "
+                "OVOS intent service did not answer the delivery probe within "
                 f"{timeout:.1f} seconds"
             )
             self._schedule_reconnect(last_error)
@@ -541,6 +609,9 @@ class OVOSAgentProtocol(AgentProtocol):
         delivery_probe_timeout = _positive_timeout(
             "delivery_probe_timeout", 2.0
         )
+        query_accept_timeout = _positive_timeout(
+            "query_accept_timeout", 2.0
+        )
         seen_replies = set()
 
         def _message(value):
@@ -614,11 +685,16 @@ class OVOSAgentProtocol(AgentProtocol):
             )
             if callable(ensure_delivery_path):
                 ensure_delivery_path(delivery_probe_timeout)
-            query_bus.emit(Message(
+            query_message = Message(
                 "recognizer_loop:utterance",
                 {"utterances": [utterance], "lang": lang},
                 query_context,
-            ))
+            )
+            emit_confirmed = getattr(query_bus, "emit_confirmed", None)
+            if callable(emit_confirmed):
+                emit_confirmed(query_message, query_accept_timeout)
+            else:
+                query_bus.emit(query_message)
             response_deadline = time.monotonic() + response_timeout
             handled_deadline = None
             answered = False
