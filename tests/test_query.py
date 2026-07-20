@@ -1,3 +1,4 @@
+import time
 from unittest.mock import MagicMock
 
 from hivemind_ovos_agent_plugin import OVOSAgentProtocol
@@ -108,6 +109,34 @@ def test_query_waits_for_speak_immediately_after_handled():
         "answer after handled",
         None,
     ]
+
+
+def test_query_completes_after_reply_when_handled_correlation_is_missing():
+    agent = _agent()
+    agent.config = {
+        "query_timeout": 0.5,
+        "query_reply_grace": 0.01,
+    }
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "answer without correlated completion"},
+            {
+                "session": {"session_id": query_id},
+                "skill_id": "fallback.skill",
+            },
+        ))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+
+    started = time.monotonic()
+    assert list(agent.natural_language_query("hello", "en-US")) == [
+        "answer without correlated completion",
+        None,
+    ]
+    assert time.monotonic() - started < 0.2
 
 
 def test_context_aware_query_preserves_speak_message_provenance():
