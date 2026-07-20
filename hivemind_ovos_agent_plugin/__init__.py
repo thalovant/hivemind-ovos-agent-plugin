@@ -673,6 +673,7 @@ class OVOSAgentProtocol(AgentProtocol):
 
         response_timeout = _positive_timeout("query_timeout", 10.0)
         handled_grace = _positive_timeout("query_handled_grace", 1.0)
+        reply_grace = _positive_timeout("query_reply_grace", 1.0)
         delivery_probe_timeout = _positive_timeout(
             "delivery_probe_timeout", 2.0
         )
@@ -764,11 +765,14 @@ class OVOSAgentProtocol(AgentProtocol):
                 query_bus.emit(query_message)
             response_deadline = time.monotonic() + response_timeout
             handled_deadline = None
+            reply_deadline = None
             answered = False
             while True:
                 deadline = response_deadline
                 if handled_deadline is not None:
                     deadline = min(deadline, handled_deadline)
+                if reply_deadline is not None:
+                    deadline = min(deadline, reply_deadline)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     yield None
@@ -785,6 +789,11 @@ class OVOSAgentProtocol(AgentProtocol):
                     handled_deadline = time.monotonic() + handled_grace
                     continue
                 answered = True
+                # Some fallback paths preserve query correlation on ``speak``
+                # but lose it on ``ovos.utterance.handled``. Once an answer
+                # exists, wait only for a short stream-settle interval instead
+                # of pinning the query worker until the full response timeout.
+                reply_deadline = time.monotonic() + reply_grace
                 if preserve_messages:
                     yield chunk
                 else:
