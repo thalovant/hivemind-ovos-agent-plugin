@@ -25,6 +25,7 @@ def _client():
     client._disconnect_escalated = False
     client._reconnect_error_after = 120.0
     client._message_send_timeout = 0.05
+    client._delivery_recovery_timeout = 0.05
     client._ping_interval = 15.0
     client._ping_timeout = 5.0
     client.session_id = "runtime-probe-test"
@@ -423,8 +424,8 @@ def test_confirmed_query_accepts_exact_runtime_receipt():
     assert client.client.send.call_count == 2
 
 
-def test_confirmed_query_reconnects_and_retries_the_exact_message(monkeypatch):
-    """One missing receipt reconnects and retries the idempotent query frame."""
+def test_confirmed_query_retries_until_the_runtime_consumer_recovers(monkeypatch):
+    """Keep retrying the exact frame after one reconnect until core returns."""
     client = _client()
     client.emitter = EventEmitter()
     message = Message(
@@ -448,7 +449,7 @@ def test_confirmed_query_reconnects_and_retries_the_exact_message(monkeypatch):
         if request.msg_type != "recognizer_loop:utterance":
             return
         payloads.append(payload)
-        if len(payloads) == 2:
+        if len(payloads) == 3:
             client.emitter.emit(
                 "thalovant.runtime.query.accepted",
                 request.reply(
@@ -465,14 +466,14 @@ def test_confirmed_query_reconnects_and_retries_the_exact_message(monkeypatch):
 
     client.emit_confirmed(message, 0.01)
 
-    assert payloads[0] == payloads[1]
+    assert payloads[0] == payloads[1] == payloads[2]
     client._schedule_reconnect.assert_called_once()
 
 
 def test_delivery_probe_reconnects_before_any_user_message(monkeypatch):
     """Replace a silent half-open path, then accept the fresh bus echo."""
     client = _client()
-    probe = MagicMock(side_effect=[False, True])
+    probe = MagicMock(side_effect=[False, False, True])
     reconnect = MagicMock()
     monkeypatch.setattr(client, "_probe_delivery_once", probe)
     monkeypatch.setattr(client, "_schedule_reconnect", reconnect)
@@ -482,7 +483,7 @@ def test_delivery_probe_reconnects_before_any_user_message(monkeypatch):
 
     client.ensure_delivery_path(0.01)
 
-    assert probe.call_args_list == [call(0.01), call(0.01)]
+    assert probe.call_args_list == [call(0.01), call(0.01), call(0.01)]
     reconnect.assert_called_once()
 
 
@@ -500,7 +501,7 @@ def test_delivery_probe_fails_bounded_after_fresh_path_is_silent(monkeypatch):
     with pytest.raises(TimeoutError, match="did not answer"):
         client.ensure_delivery_path(0.01)
 
-    assert client._schedule_reconnect.call_count == 2
+    assert client._schedule_reconnect.call_count == 1
 
 
 def test_unexpected_error_uses_upstream_error_semantics(monkeypatch):
