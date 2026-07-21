@@ -896,19 +896,21 @@ class OVOSAgentProtocol(AgentProtocol):
                     deadline = min(deadline, reply_deadline)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    LOG.warning(
-                        "OVOS query timed out before a correlated reply was "
-                        "observed"
-                    )
+                    if not answered:
+                        LOG.warning(
+                            "OVOS query timed out before a correlated reply "
+                            "was observed"
+                        )
                     yield None
                     return
                 try:
                     event, chunk = q.get(timeout=remaining)
                 except queue.Empty:
-                    LOG.warning(
-                        "OVOS query timed out before a correlated reply was "
-                        "observed"
-                    )
+                    if not answered:
+                        LOG.warning(
+                            "OVOS query timed out before a correlated reply "
+                            "was observed"
+                        )
                     yield None
                     return
                 if event == "done":

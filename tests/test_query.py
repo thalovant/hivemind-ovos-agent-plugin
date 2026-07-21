@@ -2,6 +2,7 @@ import time
 from threading import Thread
 from unittest.mock import MagicMock
 
+import hivemind_ovos_agent_plugin as agent_module
 from hivemind_ovos_agent_plugin import OVOSAgentProtocol
 from ovos_bus_client.message import Message
 from ovos_utils.fakebus import FakeBus
@@ -113,8 +114,12 @@ def test_query_waits_for_speak_immediately_after_handled():
     ]
 
 
-def test_query_completes_after_reply_when_handled_correlation_is_missing():
+def test_query_completes_after_reply_when_handled_correlation_is_missing(
+    monkeypatch,
+):
     agent = _agent()
+    logger = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", logger)
     agent.config = {
         "query_timeout": 0.5,
         "query_reply_grace": 0.01,
@@ -139,6 +144,7 @@ def test_query_completes_after_reply_when_handled_correlation_is_missing():
         None,
     ]
     assert time.monotonic() - started < 0.2
+    logger.warning.assert_not_called()
 
 
 def test_context_aware_query_preserves_speak_message_provenance():
@@ -284,8 +290,10 @@ def test_context_query_accepts_reply_routed_to_unique_client_source():
     assert chunks[1] is None
 
 
-def test_context_query_rejects_uncorrelated_reply_from_wrong_scope():
+def test_context_query_rejects_uncorrelated_reply_from_wrong_scope(monkeypatch):
     agent = _agent()
+    logger = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", logger)
     agent.config = {"query_timeout": 0.05, "query_handled_grace": 0.01}
 
     def responder(request):
@@ -308,6 +316,9 @@ def test_context_query_rejects_uncorrelated_reply_from_wrong_scope():
 
     assert list(agent.answer_query_message(admitted)) == [None]
     assert agent._active_query_scopes == {}
+    logger.warning.assert_called_once_with(
+        "OVOS query timed out before a correlated reply was observed"
+    )
 
 
 def test_context_query_rejects_foreign_active_query_id_on_matching_scope():
