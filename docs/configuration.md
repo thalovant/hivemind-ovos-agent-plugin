@@ -22,7 +22,8 @@ The plugin is configured by the `hivemind-core` `agent_protocol` block.
 | `message_send_timeout` | number | `15` | Maximum seconds a send may wait for runtime-bus reconnection. |
 | `ping_interval` | number | `15` | WebSocket ping interval used to detect half-open runtime connections. |
 | `ping_timeout` | number | `5` | Seconds to wait for a runtime-bus pong; must be below `ping_interval`. |
-| `delivery_probe_timeout` | number | `2` | Maximum seconds to wait for the harmless broker echo that proves the runtime path before a user utterance is sent. |
+| `delivery_probe_timeout` | number | `2` | Maximum seconds for each application-level runtime probe or receipt attempt. |
+| `delivery_recovery_timeout` | number | `20` | Total bounded window for exact, idempotent probe and query-receipt retries while the OVOS core consumer reconnects. |
 
 If no `host`/`port` are supplied, the plugin falls back to the
 `websocket` section of the global OVOS `Configuration()`, which is also the standard

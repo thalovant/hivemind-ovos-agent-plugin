@@ -93,7 +93,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
 
     def __init__(self, *args, reconnect_error_after=120,
                  message_send_timeout=15, ping_interval=15,
-                 ping_timeout=5, **kwargs):
+                 ping_timeout=5, delivery_recovery_timeout=20, **kwargs):
         """Initialize bounded reconnect state before creating the bus client."""
         _install_websocket_disconnect_log_filter()
         self._disconnect_started_at = None
@@ -110,6 +110,9 @@ class _RuntimeMessageBusClient(MessageBusClient):
         self._reconnect_error_after = max(reconnect_error_after, 1.0)
         self._message_send_timeout = self._positive_float(
             message_send_timeout, 15.0
+        )
+        self._delivery_recovery_timeout = self._positive_float(
+            delivery_recovery_timeout, 20.0
         )
         self._ping_interval = self._positive_float(ping_interval, 15.0)
         self._ping_timeout = self._positive_float(ping_timeout, 5.0)
@@ -382,8 +385,13 @@ class _RuntimeMessageBusClient(MessageBusClient):
             (message, "thalovant.runtime.query.accepted", "acceptance"),
         )
 
+        recovery_timeout = getattr(
+            self, "_delivery_recovery_timeout", 20.0
+        )
         for request, response_type, stage in stages:
             received = Event()
+            deadline = time.monotonic() + recovery_timeout
+            reconnected = False
 
             def _on_receipt(response):
                 if (isinstance(response, Message)
@@ -393,31 +401,39 @@ class _RuntimeMessageBusClient(MessageBusClient):
 
             self.emitter.on(response_type, _on_receipt)
             try:
-                for attempt in range(2):
+                while True:
                     received.clear()
                     self.emit(request)
-                    if received.wait(timeout):
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0 and received.wait(min(timeout, remaining)):
                         break
 
                     last_error = TimeoutError(
                         "OVOS intent service did not confirm query "
                         f"{stage} for {query_id} within {timeout:.1f} seconds"
                     )
-                    self._schedule_reconnect(last_error)
-                    if attempt == 0:
+                    if not reconnected:
+                        self._schedule_reconnect(last_error)
+                        reconnected = True
                         LOG.info(
                             "OVOS intent-service query %s receipt was not "
-                            "observed; reconnecting and retrying the exact "
-                            "frame",
+                            "observed; reconnecting once and retrying the "
+                            "exact frame for up to %.1f seconds",
                             stage,
+                            recovery_timeout,
                         )
-                        deadline = time.monotonic() + self._message_send_timeout
-                        if self._wait_for_live_transport(deadline):
-                            continue
-                        last_error = TimeoutError(
-                            "OVOS message bus did not reconnect before the "
-                            f"exact query {stage} retry"
+                        transport_deadline = min(
+                            deadline,
+                            time.monotonic() + self._message_send_timeout,
                         )
+                        self._wait_for_live_transport(transport_deadline)
+                    if time.monotonic() < deadline:
+                        continue
+                    last_error = TimeoutError(
+                        "OVOS intent service did not confirm query "
+                        f"{stage} for {query_id} within the bounded "
+                        f"{recovery_timeout:.1f}-second recovery window"
+                    )
                     LOG.error("%s", last_error)
                     raise last_error
             finally:
@@ -437,30 +453,43 @@ class _RuntimeMessageBusClient(MessageBusClient):
         path before the user utterance.
         """
         timeout = self._positive_float(probe_timeout, 2.0)
+        recovery_timeout = getattr(
+            self, "_delivery_recovery_timeout", 20.0
+        )
+        deadline = time.monotonic() + recovery_timeout
         last_error = None
-        for attempt in range(2):
-            if self._probe_delivery_once(timeout):
+        reconnected = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._probe_delivery_once(min(timeout, remaining)):
                 return
 
             last_error = TimeoutError(
                 "OVOS intent service did not answer the delivery probe within "
                 f"{timeout:.1f} seconds"
             )
-            self._schedule_reconnect(last_error)
-            if attempt == 0:
+            if not reconnected:
+                self._schedule_reconnect(last_error)
+                reconnected = True
                 LOG.info(
                     "OVOS message bus delivery path is stale; reconnecting "
-                    "before the user utterance"
+                    "once and probing for up to %.1f seconds before the user "
+                    "utterance",
+                    recovery_timeout,
                 )
-                deadline = time.monotonic() + self._message_send_timeout
-                if self._wait_for_live_transport(deadline):
-                    continue
-                last_error = TimeoutError(
-                    "OVOS message bus delivery path did not reconnect within "
-                    f"{self._message_send_timeout:.1f} seconds"
+                transport_deadline = min(
+                    deadline,
+                    time.monotonic() + self._message_send_timeout,
                 )
-            LOG.error("%s", last_error)
-            raise last_error
+                self._wait_for_live_transport(transport_deadline)
+        last_error = TimeoutError(
+            "OVOS intent service did not answer the delivery probe within the "
+            f"bounded {recovery_timeout:.1f}-second recovery window"
+        )
+        LOG.error("%s", last_error)
+        raise last_error
 
     def run_forever(self):
         """Run with ping/pong liveness so half-open sockets are bounded."""
@@ -582,6 +611,9 @@ class OVOSAgentProtocol(AgentProtocol):
                 ),
                 message_send_timeout=self.config.get(
                     "message_send_timeout", 15
+                ),
+                delivery_recovery_timeout=self.config.get(
+                    "delivery_recovery_timeout", 20
                 ),
                 ping_interval=self.config.get("ping_interval", 15),
                 ping_timeout=self.config.get("ping_timeout", 5),
