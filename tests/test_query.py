@@ -1,4 +1,5 @@
 import time
+from threading import Thread
 from unittest.mock import MagicMock
 
 from hivemind_ovos_agent_plugin import OVOSAgentProtocol
@@ -9,6 +10,7 @@ from ovos_utils.fakebus import FakeBus
 def _agent():
     agent = OVOSAgentProtocol.__new__(OVOSAgentProtocol)
     agent.bus = FakeBus()
+    agent._ensure_query_correlation_state()
     return agent
 
 
@@ -214,6 +216,218 @@ def test_answer_query_message_preserves_admitted_context():
     assert query.context["session"]["session_id"] == query.context["query_id"]
     assert query.context["session"]["session_id"] != "original-session"
     assert admitted.context["session"]["session_id"] == "original-session"
+
+
+def test_context_query_accepts_reply_with_unique_site_scope():
+    agent = _agent()
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "scope-correlated answer"},
+            {
+                "session": {"site_id": "customer-site"},
+                "skill_id": "scope.skill",
+            },
+        ))
+        agent.bus.emit(Message(
+            "ovos.utterance.handled", {}, {"query_id": query_id}
+        ))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {
+            "source": "client::one",
+            "session": {
+                "session_id": "client-session",
+                "site_id": "customer-site",
+            },
+        },
+    )
+
+    chunks = list(agent.answer_query_message(admitted))
+    assert chunks[0].data["utterance"] == "scope-correlated answer"
+    assert chunks[0].context["skill_id"] == "scope.skill"
+    assert chunks[1] is None
+    assert agent._active_query_scopes == {}
+
+
+def test_context_query_accepts_reply_routed_to_unique_client_source():
+    agent = _agent()
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "client-correlated answer"},
+            {
+                "destination": "client::one",
+                "skill_id": "scope.skill",
+            },
+        ))
+        agent.bus.emit(Message(
+            "ovos.utterance.handled", {}, {"query_id": query_id}
+        ))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"source": "client::one", "session": {"session_id": "one"}},
+    )
+
+    chunks = list(agent.answer_query_message(admitted))
+    assert chunks[0].data["utterance"] == "client-correlated answer"
+    assert chunks[1] is None
+
+
+def test_context_query_rejects_uncorrelated_reply_from_wrong_scope():
+    agent = _agent()
+    agent.config = {"query_timeout": 0.05, "query_handled_grace": 0.01}
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "wrong scope"},
+            {"session": {"site_id": "another-site"}},
+        ))
+        agent.bus.emit(Message(
+            "ovos.utterance.handled", {}, {"query_id": query_id}
+        ))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"session": {"site_id": "customer-site"}},
+    )
+
+    assert list(agent.answer_query_message(admitted)) == [None]
+    assert agent._active_query_scopes == {}
+
+
+def test_context_query_rejects_foreign_active_query_id_on_matching_scope():
+    agent = _agent()
+    agent.config = {"query_timeout": 0.05, "query_handled_grace": 0.01}
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        agent._register_active_query(
+            "foreign-query", {"session": {"site_id": "customer-site"}}
+        )
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "foreign answer"},
+            {
+                "query_id": "foreign-query",
+                "session": {"site_id": "customer-site"},
+            },
+        ))
+        agent._unregister_active_query("foreign-query")
+        agent.bus.emit(Message(
+            "ovos.utterance.handled", {}, {"query_id": query_id}
+        ))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"session": {"site_id": "customer-site"}},
+    )
+
+    assert list(agent.answer_query_message(admitted)) == [None]
+
+
+def test_context_query_rejects_ambiguous_shared_site_scope():
+    agent = _agent()
+    agent.config = {"query_timeout": 0.1, "query_handled_grace": 0.01}
+    requests = []
+    results = {}
+
+    def responder(request):
+        requests.append(request)
+        if len(requests) != 2:
+            return
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "ambiguous answer"},
+            {"session": {"site_id": "shared-site"}},
+        ))
+        for item in requests:
+            agent.bus.emit(Message(
+                "ovos.utterance.handled",
+                {},
+                {"query_id": item.context["query_id"]},
+            ))
+
+    def run_query(name):
+        admitted = Message(
+            "recognizer_loop:utterance",
+            {"utterances": [name]},
+            {
+                "source": f"client::{name}",
+                "session": {"site_id": "shared-site"},
+            },
+        )
+        results[name] = list(agent.answer_query_message(admitted))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    workers = [Thread(target=run_query, args=(name,)) for name in ("one", "two")]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=1)
+
+    assert results == {"one": [None], "two": [None]}
+    assert agent._active_query_scopes == {}
+
+
+def test_context_query_prefers_unique_client_over_shared_site():
+    agent = _agent()
+    agent._register_active_query(
+        "one",
+        {"source": "client::one", "session": {"site_id": "shared-site"}},
+    )
+    agent._register_active_query(
+        "two",
+        {"source": "client::two", "session": {"site_id": "shared-site"}},
+    )
+    response = Message(
+        "speak",
+        {"utterance": "answer for one"},
+        {
+            "destination": "client::one",
+            "session": {"site_id": "shared-site"},
+        },
+    )
+
+    assert agent._uniquely_matches_active_scope(response, "one")
+    assert not agent._uniquely_matches_active_scope(response, "two")
+
+
+def test_context_query_cleans_registry_when_delivery_fails():
+    agent = _agent()
+    agent.bus.ensure_delivery_path = MagicMock(
+        side_effect=ConnectionError("runtime unavailable")
+    )
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"source": "client::one", "session": {"site_id": "one"}},
+    )
+
+    try:
+        list(agent.answer_query_message(admitted))
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("delivery failure should propagate")
+
+    assert agent._active_query_scopes == {}
 
 
 def test_runtime_delivery_probe_precedes_user_utterance():
