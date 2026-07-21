@@ -5,7 +5,7 @@ import time
 import uuid
 from copy import deepcopy
 from threading import Event, Lock, Thread, current_thread
-from typing import Dict, Any, Iterator, Optional
+from typing import Dict, Any, Iterator, Optional, Set
 
 from ovos_bus_client import MessageBusClient
 from ovos_bus_client.client.client import _maybe_encrypt
@@ -561,6 +561,12 @@ class OVOSAgentProtocol(AgentProtocol):
     """HiveMind agent protocol that bridges client messages to an OVOS bus."""
     bus: MessageBusClient = dataclasses.field(default_factory=FakeBus)
     config: Dict[str, Any] = dataclasses.field(default_factory=lambda: Configuration().get("websocket", {}))
+    _active_query_scopes: Dict[str, Set[str]] = dataclasses.field(
+        default_factory=dict, init=False, repr=False
+    )
+    _active_query_scopes_lock: Lock = dataclasses.field(
+        default_factory=Lock, init=False, repr=False
+    )
 
     def __post_init__(self):
         if not self.bus or isinstance(self.bus, FakeBus):
@@ -643,6 +649,116 @@ class OVOSAgentProtocol(AgentProtocol):
             preserve_messages=True,
         )
 
+    def _ensure_query_correlation_state(self):
+        """Create the active-query registry for normal and test instances."""
+        if not hasattr(self, "_active_query_scopes"):
+            self._active_query_scopes = {}
+            self._active_query_scopes_lock = Lock()
+
+    @staticmethod
+    def _query_scope_tokens(context: Optional[Dict[str, Any]], *,
+                            response: bool = False) -> Set[str]:
+        """Return non-secret, server-admitted routing tokens for a query.
+
+        ``source`` identifies the admitted HiveMind client. OVOS replies often
+        move that value to ``destination``, so response contexts inspect both
+        sides while admitted request contexts register only their source.
+        Site and client identifiers are retained independently to avoid a
+        coincidental value in one namespace matching another.
+        """
+        if not isinstance(context, dict):
+            return set()
+        tokens = set()
+        session = context.get("session")
+        if isinstance(session, dict):
+            for key in ("site_id", "siteId"):
+                value = session.get(key)
+                if isinstance(value, str) and value.strip() not in ("", "unknown"):
+                    tokens.add(f"site:{value.strip()}")
+            for key in ("client_id", "clientId"):
+                value = session.get(key)
+                if isinstance(value, str) and value.strip():
+                    tokens.add(f"client:{value.strip()}")
+        for key in ("site_id", "siteId"):
+            value = context.get(key)
+            if isinstance(value, str) and value.strip() not in ("", "unknown"):
+                tokens.add(f"site:{value.strip()}")
+        for key in ("client_id", "clientId"):
+            value = context.get(key)
+            if isinstance(value, str) and value.strip():
+                tokens.add(f"client:{value.strip()}")
+        peer_keys = ("source", "destination") if response else ("source",)
+        for key in peer_keys:
+            value = context.get(key)
+            values = value if isinstance(value, list) else [value]
+            for candidate in values:
+                if isinstance(candidate, str) and candidate.strip():
+                    tokens.add(f"peer:{candidate.strip()}")
+        return tokens
+
+    @staticmethod
+    def _message_query_ids(message: Message) -> Set[str]:
+        """Return explicit correlation identifiers carried by a bus message."""
+        identifiers = set()
+        for container in (getattr(message, "context", None),
+                          getattr(message, "data", None)):
+            if not isinstance(container, dict):
+                continue
+            value = container.get("query_id")
+            if isinstance(value, str) and value:
+                identifiers.add(value)
+            session = container.get("session")
+            if isinstance(session, dict):
+                value = session.get("session_id")
+                if isinstance(value, str) and value:
+                    identifiers.add(value)
+        return identifiers
+
+    def _register_active_query(self, query_id: str,
+                               context: Optional[Dict[str, Any]]) -> None:
+        self._ensure_query_correlation_state()
+        tokens = self._query_scope_tokens(context)
+        with self._active_query_scopes_lock:
+            self._active_query_scopes[query_id] = tokens
+
+    def _unregister_active_query(self, query_id: str) -> None:
+        self._ensure_query_correlation_state()
+        with self._active_query_scopes_lock:
+            self._active_query_scopes.pop(query_id, None)
+
+    def _uniquely_matches_active_scope(self, message: Message,
+                                       query_id: str) -> bool:
+        """Match an uncorrelated reply only to one admitted active query."""
+        context = getattr(message, "context", None)
+        tokens = self._query_scope_tokens(context, response=True)
+        if not tokens:
+            return False
+        self._ensure_query_correlation_state()
+        with self._active_query_scopes_lock:
+            client_tokens = {
+                token for token in tokens
+                if token.startswith(("peer:", "client:"))
+            }
+            candidates = {
+                candidate_id
+                for candidate_id, candidate_tokens
+                in self._active_query_scopes.items()
+                if candidate_tokens.intersection(client_tokens)
+            }
+            # A server-admitted client route is more specific than a site:
+            # many identities may legitimately share one site during load.
+            if not candidates:
+                site_tokens = {
+                    token for token in tokens if token.startswith("site:")
+                }
+                candidates = {
+                    candidate_id
+                    for candidate_id, candidate_tokens
+                    in self._active_query_scopes.items()
+                    if candidate_tokens.intersection(site_tokens)
+                }
+        return candidates == {query_id}
+
     def _stream_query(self, utterance: str, lang: str, *,
                       context: Optional[Dict[str, Any]] = None,
                       bus=None, preserve_messages: bool = False
@@ -681,6 +797,7 @@ class OVOSAgentProtocol(AgentProtocol):
             "query_accept_timeout", 2.0
         )
         seen_replies = set()
+        used_scope_fallback = False
 
         def _message(value):
             if isinstance(value, str):
@@ -691,26 +808,29 @@ class OVOSAgentProtocol(AgentProtocol):
             return value
 
         def _matches_query(msg):
+            nonlocal used_scope_fallback
             msg = _message(msg)
             if msg is None:
                 return False
-            msg_context = getattr(msg, "context", None)
-            if isinstance(msg_context, dict):
-                if msg_context.get("query_id") == qid:
-                    return True
-                session = msg_context.get("session")
-                if (isinstance(session, dict)
-                        and session.get("session_id") == qid):
-                    return True
-            data = getattr(msg, "data", None)
-            if isinstance(data, dict):
-                if data.get("query_id") == qid:
-                    return True
-                session = data.get("session")
-                if (isinstance(session, dict)
-                        and session.get("session_id") == qid):
-                    return True
-            return False
+            identifiers = self._message_query_ids(msg)
+            if qid in identifiers:
+                return True
+            self._ensure_query_correlation_state()
+            with self._active_query_scopes_lock:
+                active_ids = set(self._active_query_scopes)
+            # An explicit foreign active query identifier is authoritative.
+            # Never override it merely because two clients share a site.
+            if identifiers.intersection(active_ids):
+                return False
+            if not self._uniquely_matches_active_scope(msg, qid):
+                return False
+            if not used_scope_fallback:
+                LOG.info(
+                    "Accepted OVOS reply through unique active query scope "
+                    "after query correlation was omitted"
+                )
+                used_scope_fallback = True
+            return True
 
         def _on_speak(msg):
             msg = _message(msg)
@@ -744,6 +864,7 @@ class OVOSAgentProtocol(AgentProtocol):
         query_context["session"] = session
         query_context["query_id"] = qid
 
+        self._register_active_query(qid, context)
         query_bus.on("speak", _on_speak)
         query_bus.on("ovos.utterance.speak", _on_speak)
         query_bus.on("ovos.utterance.handled", _on_done)
@@ -775,11 +896,19 @@ class OVOSAgentProtocol(AgentProtocol):
                     deadline = min(deadline, reply_deadline)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    LOG.warning(
+                        "OVOS query timed out before a correlated reply was "
+                        "observed"
+                    )
                     yield None
                     return
                 try:
                     event, chunk = q.get(timeout=remaining)
                 except queue.Empty:
+                    LOG.warning(
+                        "OVOS query timed out before a correlated reply was "
+                        "observed"
+                    )
                     yield None
                     return
                 if event == "done":
@@ -800,6 +929,7 @@ class OVOSAgentProtocol(AgentProtocol):
                     data = chunk.data if isinstance(chunk.data, dict) else {}
                     yield data.get("utterance", "")
         finally:
+            self._unregister_active_query(qid)
             query_bus.remove("speak", _on_speak)
             query_bus.remove("ovos.utterance.speak", _on_speak)
             query_bus.remove("ovos.utterance.handled", _on_done)
