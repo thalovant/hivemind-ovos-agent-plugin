@@ -2,6 +2,8 @@ import time
 from threading import Thread
 from unittest.mock import MagicMock
 
+import pytest
+
 import hivemind_ovos_agent_plugin as agent_module
 from hivemind_ovos_agent_plugin import OVOSAgentProtocol
 from ovos_bus_client.message import Message
@@ -503,8 +505,8 @@ def test_context_query_cleans_registry_when_delivery_fails():
     assert agent._active_query_scopes == {}
 
 
-def test_runtime_delivery_probe_precedes_user_utterance():
-    """Require both runtime liveness and receipt before waiting for an answer."""
+def test_confirmed_query_receipt_is_the_runtime_liveness_probe():
+    """Do not spend a second recovery window on a redundant runtime probe."""
     agent = _agent()
     order = []
     agent.bus.ensure_delivery_path = MagicMock(
@@ -531,8 +533,57 @@ def test_runtime_delivery_probe_precedes_user_utterance():
     assert list(agent.natural_language_query("hello", "en-US")) == [
         "ready", None,
     ]
-    assert order == [
-        ("probe", 2.0),
-        ("accept", 2.0),
-        ("utterance", "hello"),
+    assert order == [("accept", 2.0), ("utterance", "hello")]
+    agent.bus.ensure_delivery_path.assert_not_called()
+
+
+def test_query_timeout_includes_confirmed_delivery_time(monkeypatch):
+    """A slow receipt cannot reset the complete query timeout afterward."""
+    agent = _agent()
+    logger = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", logger)
+    agent.config = {"query_timeout": 0.05}
+
+    def slow_delivery(_message, _timeout):
+        time.sleep(0.06)
+
+    agent.bus.emit_confirmed = MagicMock(side_effect=slow_delivery)
+
+    started = time.monotonic()
+    assert list(agent.natural_language_query("hello", "en-US")) == [None]
+
+    assert time.monotonic() - started < 0.09
+    logger.warning.assert_called_once()
+
+
+def test_query_after_bounded_delivery_failure_still_flows():
+    """One failed receipt window cannot poison the next independent query."""
+    agent = _agent()
+    attempts = 0
+
+    def confirmed_delivery(message, _timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("receipt window expired")
+        agent.bus.emit(message)
+
+    agent.bus.emit_confirmed = MagicMock(side_effect=confirmed_delivery)
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        context = {"session": {"session_id": query_id}}
+        agent.bus.emit(Message(
+            "speak", {"utterance": "recovered"}, context
+        ))
+        agent.bus.emit(Message("ovos.utterance.handled", {}, context))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+
+    with pytest.raises(TimeoutError, match="receipt window expired"):
+        list(agent.natural_language_query("first", "en-US"))
+
+    assert list(agent.natural_language_query("second", "en-US")) == [
+        "recovered", None,
     ]
+    assert agent._active_query_scopes == {}

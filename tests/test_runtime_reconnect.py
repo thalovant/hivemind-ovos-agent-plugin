@@ -515,6 +515,45 @@ def test_confirmed_query_retries_until_the_runtime_consumer_recovers(monkeypatch
     client._schedule_reconnect.assert_called_once()
 
 
+def test_confirmed_query_stages_share_one_total_recovery_budget(monkeypatch):
+    """Reservation and acceptance cannot each consume a full recovery window."""
+    client = _client()
+    client.emitter = EventEmitter()
+    message = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"query_id": "query-1"},
+    )
+
+    def acknowledge_reservation_only(payload):
+        request = Message.deserialize(payload)
+        if request.msg_type == "thalovant.runtime.query.prepare":
+            client.emitter.emit(
+                "thalovant.runtime.query.prepared",
+                request.reply(
+                    "thalovant.runtime.query.prepared",
+                    {"query_id": "query-1"},
+                ),
+            )
+
+    client.client.send.side_effect = acknowledge_reservation_only
+    monkeypatch.setattr(client, "_schedule_reconnect", MagicMock())
+    monkeypatch.setattr(
+        client, "_wait_for_live_transport", MagicMock(return_value=True)
+    )
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="delivery window"):
+        client.emit_confirmed(
+            message,
+            acceptance_timeout=0.01,
+            recovery_timeout=0.05,
+        )
+
+    assert time.monotonic() - started < 0.15
+    client._schedule_reconnect.assert_called_once()
+
+
 def test_delivery_probe_reconnects_before_any_user_message(monkeypatch):
     """Replace a silent half-open path, then accept the fresh bus echo."""
     client = _client()

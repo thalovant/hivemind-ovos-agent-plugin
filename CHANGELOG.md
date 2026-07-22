@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.2a9] - 2026-07-22
+
+- Use the idempotent query-reservation receipt as the runtime application
+  liveness proof and share one absolute delivery deadline across reservation,
+  acceptance, and the complete query lifecycle.
+
 ## [0.3.2a8] - 2026-07-22
 
 - Keep queries open through the authoritative OVOS skill-handler lifecycle so

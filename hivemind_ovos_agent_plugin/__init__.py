@@ -405,7 +405,8 @@ class _RuntimeMessageBusClient(MessageBusClient):
             except (KeyError, ValueError):
                 pass
 
-    def emit_confirmed(self, message, acceptance_timeout=2):
+    def emit_confirmed(self, message, acceptance_timeout=2,
+                       recovery_timeout=None):
         """Deliver one query with an intent-service receipt and exact retry.
 
         Reserve ``query_id`` without a side effect, then require the runtime to
@@ -426,12 +427,17 @@ class _RuntimeMessageBusClient(MessageBusClient):
             (message, "thalovant.runtime.query.accepted", "acceptance"),
         )
 
-        recovery_timeout = getattr(
-            self, "_delivery_recovery_timeout", 20.0
-        )
+        if recovery_timeout is None:
+            recovery_timeout = getattr(
+                self, "_delivery_recovery_timeout", 20.0
+            )
+        recovery_timeout = self._positive_float(recovery_timeout, 20.0)
+        # Reservation and acceptance are one delivery transaction. Sharing one
+        # deadline prevents two independent recovery windows from exceeding
+        # the caller's complete query timeout.
+        deadline = time.monotonic() + recovery_timeout
         for request, response_type, stage in stages:
             received = Event()
-            deadline = time.monotonic() + recovery_timeout
             reconnected = False
 
             def _on_receipt(response):
@@ -443,6 +449,13 @@ class _RuntimeMessageBusClient(MessageBusClient):
             self.emitter.on(response_type, _on_receipt)
             try:
                 while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "OVOS intent service did not confirm query "
+                            f"{stage} for {query_id} within the bounded "
+                            f"{recovery_timeout:.1f}-second delivery window"
+                        )
                     received.clear()
                     self.emit(request)
                     remaining = deadline - time.monotonic()
@@ -459,7 +472,8 @@ class _RuntimeMessageBusClient(MessageBusClient):
                         LOG.info(
                             "OVOS intent-service query %s receipt was not "
                             "observed; reconnecting once and retrying the "
-                            "exact frame for up to %.1f seconds",
+                            "exact frame within the shared %.1f-second "
+                            "delivery window",
                             stage,
                             recovery_timeout,
                         )
@@ -473,7 +487,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     last_error = TimeoutError(
                         "OVOS intent service did not confirm query "
                         f"{stage} for {query_id} within the bounded "
-                        f"{recovery_timeout:.1f}-second recovery window"
+                        f"{recovery_timeout:.1f}-second delivery window"
                     )
                     LOG.error("%s", last_error)
                     raise last_error
@@ -834,7 +848,10 @@ class OVOSAgentProtocol(AgentProtocol):
 
         OVOS skills expose their real handler lifecycle through
         ``mycroft.skill.handler.start`` and ``mycroft.skill.handler.complete``.
-        Once a handler starts, keep the query open until that lifecycle ends
+        Confirmed delivery uses the idempotent reservation receipt as its
+        application-liveness proof, and every delivery/reply stage shares the
+        complete query deadline. Once a handler starts, keep the query open
+        until that lifecycle ends
         instead of applying the short reply-settle fallback to an intermediate
         ``speak``.  The fallback remains bounded for common-query and legacy
         paths that do not emit handler lifecycle events.  The context-aware
@@ -950,11 +967,7 @@ class OVOSAgentProtocol(AgentProtocol):
         query_bus.on("mycroft.skill.handler.error", _on_handler_done)
         query_bus.on("ovos.utterance.handled", _on_done)
         try:
-            ensure_delivery_path = getattr(
-                query_bus, "ensure_delivery_path", None
-            )
-            if callable(ensure_delivery_path):
-                ensure_delivery_path(delivery_probe_timeout)
+            response_deadline = time.monotonic() + response_timeout
             query_message = Message(
                 "recognizer_loop:utterance",
                 {"utterances": [utterance], "lang": lang},
@@ -962,10 +975,40 @@ class OVOSAgentProtocol(AgentProtocol):
             )
             emit_confirmed = getattr(query_bus, "emit_confirmed", None)
             if callable(emit_confirmed):
-                emit_confirmed(query_message, query_accept_timeout)
+                # The reservation receipt already proves that the intent
+                # service consumed a frame, so a separate application probe
+                # only adds another independent recovery window. Reserve at
+                # most half of the complete query timeout for delivery and
+                # leave the remainder for the skill handler lifecycle.
+                delivery_budget = min(
+                    getattr(query_bus, "_delivery_recovery_timeout", 20.0),
+                    response_timeout / 2,
+                )
+                if isinstance(query_bus, _RuntimeMessageBusClient):
+                    emit_confirmed(
+                        query_message,
+                        min(query_accept_timeout, delivery_budget),
+                        recovery_timeout=delivery_budget,
+                    )
+                else:
+                    emit_confirmed(
+                        query_message,
+                        min(query_accept_timeout, delivery_budget),
+                    )
             else:
+                ensure_delivery_path = getattr(
+                    query_bus, "ensure_delivery_path", None
+                )
+                if callable(ensure_delivery_path):
+                    ensure_delivery_path(
+                        min(delivery_probe_timeout, response_timeout / 2)
+                    )
+                if time.monotonic() >= response_deadline:
+                    raise TimeoutError(
+                        "OVOS query delivery exceeded the complete query "
+                        "timeout"
+                    )
                 query_bus.emit(query_message)
-            response_deadline = time.monotonic() + response_timeout
             handled_deadline = None
             reply_deadline = None
             answered = False

@@ -23,9 +23,12 @@ The plugin is configured by the `hivemind-core` `agent_protocol` block.
 | `ping_interval` | number | `15` | WebSocket ping interval used to detect half-open runtime connections. |
 | `ping_timeout` | number | `5` | Seconds to wait for a runtime-bus pong; must be below `ping_interval`. |
 | `delivery_probe_timeout` | number | `2` | Maximum seconds for each application-level runtime probe or receipt attempt. |
-| `delivery_recovery_timeout` | number | `20` | Total bounded window for exact, idempotent probe and query-receipt retries while the OVOS core consumer reconnects. |
+| `delivery_recovery_timeout` | number | `20` | Maximum shared window for exact, idempotent query reservation and acceptance while the OVOS core consumer reconnects. The effective query-delivery budget is also capped at half of `query_timeout`. |
 
-`query_timeout` bounds the complete skill-handler lifecycle. Intermediate
+`query_timeout` bounds delivery and the complete skill-handler lifecycle.
+Confirmed queries use their reservation receipt as the application-level
+liveness proof instead of paying for a separate probe recovery window.
+Intermediate
 speech does not close a query while an OVOS handler is still active; legacy
 and common-query paths without lifecycle events retain the bounded
 `query_reply_grace` settle fallback.
