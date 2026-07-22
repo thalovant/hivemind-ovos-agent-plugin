@@ -147,6 +147,68 @@ def test_query_completes_after_reply_when_handled_correlation_is_missing(
     logger.warning.assert_not_called()
 
 
+def test_query_waits_for_real_handler_completion_after_progress_speak():
+    agent = _agent()
+    agent.config = {
+        "query_timeout": 0.5,
+        "query_reply_grace": 0.01,
+    }
+    worker = None
+
+    def responder(request):
+        nonlocal worker
+        query_id = request.context["query_id"]
+        context = {
+            "session": {"session_id": query_id},
+            "skill_id": "slow.skill",
+        }
+        agent.bus.emit(Message(
+            "mycroft.skill.handler.start", {}, context
+        ))
+        agent.bus.emit(Message(
+            "speak", {"utterance": "working"}, context
+        ))
+
+        def finish_handler():
+            time.sleep(0.03)
+            agent.bus.emit(Message(
+                "speak", {"utterance": "final answer"}, context
+            ))
+            agent.bus.emit(Message(
+                "mycroft.skill.handler.complete", {}, context
+            ))
+
+        worker = Thread(target=finish_handler)
+        worker.start()
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+
+    assert list(agent.natural_language_query("hello", "en-US")) == [
+        "working",
+        "final answer",
+        None,
+    ]
+    worker.join(timeout=1)
+
+
+def test_query_handler_error_is_terminal_without_handled_event():
+    agent = _agent()
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        context = {"session": {"session_id": query_id}}
+        agent.bus.emit(Message(
+            "mycroft.skill.handler.start", {}, context
+        ))
+        agent.bus.emit(Message(
+            "mycroft.skill.handler.error", {}, context
+        ))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+
+    assert list(agent.natural_language_query("hello", "en-US")) == [None]
+
+
 def test_context_aware_query_preserves_speak_message_provenance():
     agent = _agent()
 

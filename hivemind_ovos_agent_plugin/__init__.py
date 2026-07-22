@@ -832,11 +832,14 @@ class OVOSAgentProtocol(AgentProtocol):
                       ) -> "Iterator[Optional[Any]]":
         """Collect one OVOS answer using query-id or session correlation.
 
-        OVOS skills may emit ``ovos.utterance.handled`` immediately before an
-        asynchronous ``speak``.  Treating ``handled`` as an unconditional end
-        marker loses that valid answer, so an unanswered query gets a short,
-        bounded grace period.  The context-aware HiveMind seam also receives
-        the original speak Message so core can retain safe skill provenance.
+        OVOS skills expose their real handler lifecycle through
+        ``mycroft.skill.handler.start`` and ``mycroft.skill.handler.complete``.
+        Once a handler starts, keep the query open until that lifecycle ends
+        instead of applying the short reply-settle fallback to an intermediate
+        ``speak``.  The fallback remains bounded for common-query and legacy
+        paths that do not emit handler lifecycle events.  The context-aware
+        HiveMind seam also receives the original speak Message so core can
+        retain safe skill provenance.
         """
         import queue
         import time
@@ -916,6 +919,14 @@ class OVOSAgentProtocol(AgentProtocol):
                 seen_replies.add(fingerprint)
                 q.put(("speak", msg))
 
+        def _on_handler_start(msg):
+            if _matches_query(msg):
+                q.put(("handler_start", None))
+
+        def _on_handler_done(msg):
+            if _matches_query(msg):
+                q.put(("handler_done", None))
+
         def _on_done(msg):
             if _matches_query(msg):
                 q.put(("done", None))
@@ -934,6 +945,9 @@ class OVOSAgentProtocol(AgentProtocol):
         self._register_active_query(qid, context)
         query_bus.on("speak", _on_speak)
         query_bus.on("ovos.utterance.speak", _on_speak)
+        query_bus.on("mycroft.skill.handler.start", _on_handler_start)
+        query_bus.on("mycroft.skill.handler.complete", _on_handler_done)
+        query_bus.on("mycroft.skill.handler.error", _on_handler_done)
         query_bus.on("ovos.utterance.handled", _on_done)
         try:
             ensure_delivery_path = getattr(
@@ -955,6 +969,7 @@ class OVOSAgentProtocol(AgentProtocol):
             handled_deadline = None
             reply_deadline = None
             answered = False
+            handler_active = False
             while True:
                 deadline = response_deadline
                 if handled_deadline is not None:
@@ -980,6 +995,14 @@ class OVOSAgentProtocol(AgentProtocol):
                         )
                     yield None
                     return
+                if event == "handler_start":
+                    handler_active = True
+                    handled_deadline = None
+                    reply_deadline = None
+                    continue
+                if event == "handler_done":
+                    yield None
+                    return
                 if event == "done":
                     if answered:
                         yield None
@@ -987,11 +1010,11 @@ class OVOSAgentProtocol(AgentProtocol):
                     handled_deadline = time.monotonic() + handled_grace
                     continue
                 answered = True
-                # Some fallback paths preserve query correlation on ``speak``
-                # but lose it on ``ovos.utterance.handled``. Once an answer
-                # exists, wait only for a short stream-settle interval instead
-                # of pinning the query worker until the full response timeout.
-                reply_deadline = time.monotonic() + reply_grace
+                # Explicit skill handlers can emit progress speech while their
+                # real work is still running. Their lifecycle is authoritative;
+                # the short settle fallback is only for paths without it.
+                if not handler_active:
+                    reply_deadline = time.monotonic() + reply_grace
                 if preserve_messages:
                     yield chunk
                 else:
@@ -1001,6 +1024,9 @@ class OVOSAgentProtocol(AgentProtocol):
             self._unregister_active_query(qid)
             query_bus.remove("speak", _on_speak)
             query_bus.remove("ovos.utterance.speak", _on_speak)
+            query_bus.remove("mycroft.skill.handler.start", _on_handler_start)
+            query_bus.remove("mycroft.skill.handler.complete", _on_handler_done)
+            query_bus.remove("mycroft.skill.handler.error", _on_handler_done)
             query_bus.remove("ovos.utterance.handled", _on_done)
 
     # mycroft handlers - from master -> slave
