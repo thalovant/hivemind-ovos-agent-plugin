@@ -219,6 +219,51 @@ def test_send_recovers_a_stale_transport_without_leaking_worker(monkeypatch):
     replacement.send.assert_called_once()
 
 
+def test_reconnect_wakeup_does_not_wait_for_stale_transport_close(monkeypatch):
+    """A wedged WebSocketApp.close cannot strand the query recovery caller."""
+    client = _client()
+    client._message_send_timeout = 0.05
+    release_close = Event()
+    close_started = Event()
+
+    def blocked_close():
+        close_started.set()
+        release_close.wait(1)
+
+    client.client.close.side_effect = blocked_close
+    client._reconnect_worker = MagicMock()
+    client._reconnect_worker.is_alive.return_value = True
+
+    started = time.monotonic()
+    client._schedule_reconnect(TimeoutError("stale runtime path"))
+    elapsed = time.monotonic() - started
+
+    assert close_started.wait(0.1)
+    assert elapsed < 0.2
+    assert client.client.keep_running is False
+    release_close.set()
+
+
+def test_reconnect_supervisor_replaces_transport_after_bounded_close(monkeypatch):
+    """The supervisor progresses even when the retired close never returns."""
+    client = _client()
+    client._ensure_reconnect_state()
+    client._message_send_timeout = 0.05
+    release_close = Event()
+    client.client.close.side_effect = lambda: release_close.wait(1)
+    replacement = MagicMock()
+    client.create_client.return_value = replacement
+    client._reconnect_error = TimeoutError("stale runtime path")
+    monkeypatch.setattr(agent_module.time, "sleep", MagicMock())
+
+    client._run_reconnect_loop()
+
+    client.create_client.assert_called_once_with()
+    client.run_forever.assert_called_once_with()
+    assert client.client is replacement
+    release_close.set()
+
+
 def test_closed_send_reconnects_and_retries_exact_frame(monkeypatch):
     """A send-detected close gets one bounded retry on the fresh socket."""
     client = _client()

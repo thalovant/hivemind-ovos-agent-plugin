@@ -169,12 +169,57 @@ class _RuntimeMessageBusClient(MessageBusClient):
         if not hasattr(self, "_send_lock"):
             self._send_lock = Lock()
 
+    def _close_stale_transport(self, transport):
+        """Wake one stale websocket without blocking a query or supervisor.
+
+        ``websocket-client`` may wait indefinitely in ``WebSocketApp.close``
+        when another thread is stuck in a frame write.  Recovery only needs to
+        retire that exact transport; the reconnect worker owns its replacement.
+        Mark the old run loop stopped immediately and bound the best-effort
+        close on a daemon thread.
+        """
+        if transport is None:
+            return True
+        try:
+            transport.keep_running = False
+        except Exception:
+            pass
+
+        completed = Event()
+
+        def _close():
+            try:
+                transport.close()
+            except Exception as exc:
+                LOG.info("Could not close stale OVOS bus transport: %s", exc)
+            finally:
+                completed.set()
+
+        closer = Thread(
+            target=_close,
+            name="ovos-runtime-transport-close",
+            daemon=True,
+        )
+        closer.start()
+        timeout = min(
+            getattr(self, "_message_send_timeout", 15.0),
+            1.0,
+        )
+        if completed.wait(timeout):
+            return True
+        LOG.info(
+            "OVOS bus transport close exceeded %.1f seconds; continuing "
+            "bounded recovery",
+            timeout,
+        )
+        return False
+
     def _schedule_reconnect(self, error):
         """Start one durable reconnect worker for error and clean-close paths."""
         self._ensure_reconnect_state()
         was_connected = self.connected_event.is_set()
         self.connected_event.clear()
-        wake_worker = False
+        stale_transport = None
         with self._reconnect_state_lock:
             if self._close_requested:
                 return
@@ -187,10 +232,9 @@ class _RuntimeMessageBusClient(MessageBusClient):
                 # socket, so close that stale transport to wake the existing
                 # supervisor instead of leaving it unable to consume the new
                 # reconnect request.
-                wake_worker = (
-                    was_connected
-                    and self._reconnect_worker is not current_thread()
-                )
+                if (was_connected
+                        and self._reconnect_worker is not current_thread()):
+                    stale_transport = self.client
             else:
                 self._reconnect_worker = Thread(
                     target=self._run_reconnect_loop,
@@ -198,11 +242,8 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     daemon=True,
                 )
                 self._reconnect_worker.start()
-        if wake_worker:
-            try:
-                self.client.close()
-            except Exception as exc:
-                LOG.info("Could not close stale OVOS bus transport: %s", exc)
+        if stale_transport is not None:
+            self._close_stale_transport(stale_transport)
 
     def _transport_is_open(self):
         """Return whether websocket-client still has a live transport."""
@@ -531,15 +572,9 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     type(error).__name__,
                 )
 
-            try:
-                if self.client.keep_running:
-                    self.client.close()
-            except Exception as exc:
-                LOG.error(
-                    "Exception closing websocket at %s: %s",
-                    self.client.url,
-                    exc,
-                )
+            stale_transport = self.client
+            if getattr(stale_transport, "keep_running", False):
+                self._close_stale_transport(stale_transport)
 
             time.sleep(self.retry)
             self.retry = min(self.retry * 2, 60)
