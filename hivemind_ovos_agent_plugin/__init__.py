@@ -407,11 +407,12 @@ class _RuntimeMessageBusClient(MessageBusClient):
 
     def emit_confirmed(self, message, acceptance_timeout=2,
                        recovery_timeout=None):
-        """Deliver one query with an intent-service receipt and exact retry.
+        """Deliver one query with a post-transform receipt and exact retry.
 
         Reserve ``query_id`` without a side effect, then require the runtime to
-        acknowledge the exact utterance before intent matching. If a frame or
-        receipt is lost, reconnect once and repeat that idempotent stage.
+        confirm that the exact utterance passed its bounded transformer stage.
+        If a frame or receipt is lost, reconnect once and repeat that
+        idempotent stage.
         """
         context = message.context if isinstance(message.context, dict) else {}
         query_id = context.get("query_id")
@@ -424,7 +425,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
         )
         stages = (
             (prepare, "thalovant.runtime.query.prepared", "reservation"),
-            (message, "thalovant.runtime.query.accepted", "acceptance"),
+            (message, "thalovant.runtime.query.started", "pipeline start"),
         )
 
         if recovery_timeout is None:
@@ -432,9 +433,9 @@ class _RuntimeMessageBusClient(MessageBusClient):
                 self, "_delivery_recovery_timeout", 20.0
             )
         recovery_timeout = self._positive_float(recovery_timeout, 20.0)
-        # Reservation and acceptance are one delivery transaction. Sharing one
-        # deadline prevents two independent recovery windows from exceeding
-        # the caller's complete query timeout.
+        # Reservation and pipeline start are one delivery transaction. One
+        # deadline prevents independent recovery windows from exceeding the
+        # caller's complete query timeout.
         deadline = time.monotonic() + recovery_timeout
         for request, response_type, stage in stages:
             received = Event()
@@ -848,7 +849,7 @@ class OVOSAgentProtocol(AgentProtocol):
 
         OVOS skills expose their real handler lifecycle through
         ``mycroft.skill.handler.start`` and ``mycroft.skill.handler.complete``.
-        Confirmed delivery uses the idempotent reservation receipt as its
+        Confirmed delivery uses the idempotent post-transform receipt as its
         application-liveness proof, and every delivery/reply stage shares the
         complete query deadline. Once a handler starts, keep the query open
         until that lifecycle ends
@@ -975,10 +976,10 @@ class OVOSAgentProtocol(AgentProtocol):
             )
             emit_confirmed = getattr(query_bus, "emit_confirmed", None)
             if callable(emit_confirmed):
-                # The reservation receipt already proves that the intent
-                # service consumed a frame, so a separate application probe
-                # only adds another independent recovery window. Reserve at
-                # most half of the complete query timeout for delivery and
+                # The post-transform receipt proves that the intent service
+                # reached a runnable pipeline stage, so a separate application
+                # probe only adds another independent recovery window. Reserve
+                # at most half of the complete query timeout for delivery and
                 # leave the remainder for the skill handler lifecycle.
                 delivery_budget = min(
                     getattr(query_bus, "_delivery_recovery_timeout", 20.0),

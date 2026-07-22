@@ -438,8 +438,8 @@ def test_delivery_probe_rejects_broker_self_echo_without_runtime_response():
     assert client._probe_delivery_once(0.01) is False
 
 
-def test_confirmed_query_accepts_exact_runtime_receipt():
-    """Return only after the intent service acknowledges this query ID."""
+def test_confirmed_query_accepts_exact_post_transform_receipt():
+    """Return only after the intent pipeline starts this exact query ID."""
     client = _client()
     client.emitter = EventEmitter()
     message = Message(
@@ -453,7 +453,7 @@ def test_confirmed_query_accepts_exact_runtime_receipt():
         if request.msg_type == "thalovant.runtime.query.prepare":
             response_type = "thalovant.runtime.query.prepared"
         else:
-            response_type = "thalovant.runtime.query.accepted"
+            response_type = "thalovant.runtime.query.started"
         client.emitter.emit(
             response_type,
             request.reply(
@@ -496,9 +496,9 @@ def test_confirmed_query_retries_until_the_runtime_consumer_recovers(monkeypatch
         payloads.append(payload)
         if len(payloads) == 3:
             client.emitter.emit(
-                "thalovant.runtime.query.accepted",
+                "thalovant.runtime.query.started",
                 request.reply(
-                    "thalovant.runtime.query.accepted",
+                    "thalovant.runtime.query.started",
                     {"query_id": "query-1", "duplicate": True},
                 ),
             )
@@ -516,7 +516,7 @@ def test_confirmed_query_retries_until_the_runtime_consumer_recovers(monkeypatch
 
 
 def test_confirmed_query_stages_share_one_total_recovery_budget(monkeypatch):
-    """Reservation and acceptance cannot each consume a full recovery window."""
+    """Reservation and pipeline start share one recovery window."""
     client = _client()
     client.emitter = EventEmitter()
     message = Message(
@@ -525,7 +525,7 @@ def test_confirmed_query_stages_share_one_total_recovery_budget(monkeypatch):
         {"query_id": "query-1"},
     )
 
-    def acknowledge_reservation_only(payload):
+    def acknowledge_before_pipeline_start(payload):
         request = Message.deserialize(payload)
         if request.msg_type == "thalovant.runtime.query.prepare":
             client.emitter.emit(
@@ -535,8 +535,16 @@ def test_confirmed_query_stages_share_one_total_recovery_budget(monkeypatch):
                     {"query_id": "query-1"},
                 ),
             )
+        elif request.msg_type == "recognizer_loop:utterance":
+            client.emitter.emit(
+                "thalovant.runtime.query.accepted",
+                request.reply(
+                    "thalovant.runtime.query.accepted",
+                    {"query_id": "query-1", "duplicate": False},
+                ),
+            )
 
-    client.client.send.side_effect = acknowledge_reservation_only
+    client.client.send.side_effect = acknowledge_before_pipeline_start
     monkeypatch.setattr(client, "_schedule_reconnect", MagicMock())
     monkeypatch.setattr(
         client, "_wait_for_live_transport", MagicMock(return_value=True)
