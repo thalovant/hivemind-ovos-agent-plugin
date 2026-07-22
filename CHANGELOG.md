@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.2a11] - 2026-07-22
+
+- Keep runtime-bus event subscriptions immutable while queries are active and
+  dispatch responses through an agent-owned registry, preventing pyee emitter
+  deadlocks under sustained query traffic.
+
 ## [0.3.2a10] - 2026-07-22
 
 - Require the managed runtime's post-transform query receipt before treating

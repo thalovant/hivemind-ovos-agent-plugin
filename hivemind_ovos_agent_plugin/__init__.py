@@ -5,7 +5,7 @@ import time
 import uuid
 from copy import deepcopy
 from threading import Event, Lock, Thread, current_thread
-from typing import Dict, Any, Iterator, Optional, Set
+from typing import Callable, Dict, Any, Iterator, Optional, Set
 
 from ovos_bus_client import MessageBusClient
 from ovos_bus_client.client.client import _maybe_encrypt
@@ -646,6 +646,18 @@ class OVOSAgentProtocol(AgentProtocol):
     _active_query_scopes_lock: Lock = dataclasses.field(
         default_factory=Lock, init=False, repr=False
     )
+    _active_query_callbacks: Dict[str, Dict[str, Callable]] = dataclasses.field(
+        default_factory=dict, init=False, repr=False
+    )
+    _query_dispatcher_buses: Set[int] = dataclasses.field(
+        default_factory=set, init=False, repr=False
+    )
+    _query_dispatcher_handlers: Dict[int, list] = dataclasses.field(
+        default_factory=dict, init=False, repr=False
+    )
+    _query_dispatcher_setup_lock: Lock = dataclasses.field(
+        default_factory=Lock, init=False, repr=False
+    )
 
     def __post_init__(self):
         if not self.bus or isinstance(self.bus, FakeBus):
@@ -668,6 +680,11 @@ class OVOSAgentProtocol(AgentProtocol):
                 ping_interval=self.config.get("ping_interval", 15),
                 ping_timeout=self.config.get("ping_timeout", 5),
             )
+            # Install one immutable set of runtime-bus handlers before the
+            # websocket receive thread starts. Per-query ``on``/``remove``
+            # mutations can deadlock pyee's non-reentrant emitter lock while
+            # that receive thread is dispatching a message.
+            self._ensure_query_dispatchers(self.bus)
             self.bus.run_in_thread()
             # Fail fast instead of blocking forever: a bare ``connected_event.wait()``
             # hangs indefinitely when no OVOS messagebus is reachable, which silently
@@ -681,6 +698,8 @@ class OVOSAgentProtocol(AgentProtocol):
                     f"Is the OVOS messagebus running? Start it (e.g. 'ovos-messagebus'), "
                     f"or set the agent protocol's host/port/connection_timeout in the config."
                 )
+        else:
+            self._ensure_query_dispatchers(self.bus)
         self.register_bus_handlers()
 
     def register_bus_handlers(self):
@@ -736,6 +755,72 @@ class OVOSAgentProtocol(AgentProtocol):
         if not hasattr(self, "_active_query_scopes"):
             self._active_query_scopes = {}
             self._active_query_scopes_lock = Lock()
+        if not hasattr(self, "_active_query_callbacks"):
+            self._active_query_callbacks = {}
+        if not hasattr(self, "_query_dispatcher_buses"):
+            self._query_dispatcher_buses = set()
+            self._query_dispatcher_handlers = {}
+            self._query_dispatcher_setup_lock = Lock()
+
+    def _ensure_query_dispatchers(self, bus) -> None:
+        """Install one permanent bus dispatcher set for every used bus.
+
+        Runtime messages arrive on the websocket receive thread while query
+        workers consume them. Mutating pyee registrations from those workers
+        can leave its plain ``Lock`` permanently held under that contention.
+        Keep the emitter topology immutable and route events through a small
+        agent-owned registry instead.
+        """
+        self._ensure_query_correlation_state()
+        bus_id = id(bus)
+        with self._query_dispatcher_setup_lock:
+            if bus_id in self._query_dispatcher_buses:
+                return
+
+            def dispatch(event):
+                def _handler(message):
+                    self._dispatch_active_query_event(event, message)
+                return _handler
+
+            speak = dispatch("speak")
+            handler_done = dispatch("handler_done")
+            registrations = [
+                ("speak", speak),
+                ("ovos.utterance.speak", speak),
+                ("mycroft.skill.handler.start", dispatch("handler_start")),
+                ("mycroft.skill.handler.complete", handler_done),
+                ("mycroft.skill.handler.error", handler_done),
+                ("ovos.utterance.handled", dispatch("done")),
+            ]
+            installed = []
+            try:
+                for event_name, callback in registrations:
+                    bus.on(event_name, callback)
+                    installed.append((event_name, callback))
+            except Exception:
+                for event_name, callback in reversed(installed):
+                    try:
+                        bus.remove(event_name, callback)
+                    except Exception:
+                        pass
+                raise
+            self._query_dispatcher_handlers[bus_id] = registrations
+            self._query_dispatcher_buses.add(bus_id)
+
+    def _dispatch_active_query_event(self, event: str, message) -> None:
+        """Fan one immutable bus subscription into active query callbacks."""
+        self._ensure_query_correlation_state()
+        with self._active_query_scopes_lock:
+            callbacks = [
+                handlers.get(event)
+                for handlers in self._active_query_callbacks.values()
+                if handlers.get(event) is not None
+            ]
+        for callback in callbacks:
+            try:
+                callback(message)
+            except Exception:
+                LOG.exception("Active OVOS query %s dispatcher raised", event)
 
     @staticmethod
     def _query_scope_tokens(context: Optional[Dict[str, Any]], *,
@@ -796,17 +881,20 @@ class OVOSAgentProtocol(AgentProtocol):
                     identifiers.add(value)
         return identifiers
 
-    def _register_active_query(self, query_id: str,
-                               context: Optional[Dict[str, Any]]) -> None:
+    def _register_active_query(
+            self, query_id: str, context: Optional[Dict[str, Any]],
+            callbacks: Optional[Dict[str, Callable]] = None) -> None:
         self._ensure_query_correlation_state()
         tokens = self._query_scope_tokens(context)
         with self._active_query_scopes_lock:
             self._active_query_scopes[query_id] = tokens
+            self._active_query_callbacks[query_id] = dict(callbacks or {})
 
     def _unregister_active_query(self, query_id: str) -> None:
         self._ensure_query_correlation_state()
         with self._active_query_scopes_lock:
             self._active_query_scopes.pop(query_id, None)
+            self._active_query_callbacks.pop(query_id, None)
 
     def _uniquely_matches_active_scope(self, message: Message,
                                        query_id: str) -> bool:
@@ -960,13 +1048,13 @@ class OVOSAgentProtocol(AgentProtocol):
         query_context["session"] = session
         query_context["query_id"] = qid
 
-        self._register_active_query(qid, context)
-        query_bus.on("speak", _on_speak)
-        query_bus.on("ovos.utterance.speak", _on_speak)
-        query_bus.on("mycroft.skill.handler.start", _on_handler_start)
-        query_bus.on("mycroft.skill.handler.complete", _on_handler_done)
-        query_bus.on("mycroft.skill.handler.error", _on_handler_done)
-        query_bus.on("ovos.utterance.handled", _on_done)
+        self._ensure_query_dispatchers(query_bus)
+        self._register_active_query(qid, context, {
+            "speak": _on_speak,
+            "handler_start": _on_handler_start,
+            "handler_done": _on_handler_done,
+            "done": _on_done,
+        })
         try:
             response_deadline = time.monotonic() + response_timeout
             query_message = Message(
@@ -1066,12 +1154,6 @@ class OVOSAgentProtocol(AgentProtocol):
                     yield data.get("utterance", "")
         finally:
             self._unregister_active_query(qid)
-            query_bus.remove("speak", _on_speak)
-            query_bus.remove("ovos.utterance.speak", _on_speak)
-            query_bus.remove("mycroft.skill.handler.start", _on_handler_start)
-            query_bus.remove("mycroft.skill.handler.complete", _on_handler_done)
-            query_bus.remove("mycroft.skill.handler.error", _on_handler_done)
-            query_bus.remove("ovos.utterance.handled", _on_done)
 
     # mycroft handlers - from master -> slave
     def handle_send(self, message: Message):

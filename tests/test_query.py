@@ -587,3 +587,31 @@ def test_query_after_bounded_delivery_failure_still_flows():
         "recovered", None,
     ]
     assert agent._active_query_scopes == {}
+
+
+def test_sequential_queries_keep_runtime_bus_subscriptions_immutable():
+    """Query cleanup must never mutate pyee from a worker thread."""
+    agent = _agent()
+    agent.bus.remove = MagicMock(
+        side_effect=AssertionError("per-query bus removal is unsafe")
+    )
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        context = {"session": {"session_id": query_id}}
+        agent.bus.emit(Message(
+            "speak", {"utterance": "ready"}, context
+        ))
+        agent.bus.emit(Message("ovos.utterance.handled", {}, context))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+
+    for index in range(100):
+        assert list(agent.natural_language_query(
+            f"query {index}", "en-US"
+        )) == ["ready", None]
+
+    agent.bus.remove.assert_not_called()
+    assert agent._active_query_scopes == {}
+    assert agent._active_query_callbacks == {}
+    assert len(agent._query_dispatcher_buses) == 1
