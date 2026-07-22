@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.2a10] - 2026-07-22
+
+- Require the managed runtime's post-transform query receipt before treating
+  delivery as confirmed, while preserving exact retry and one shared deadline.
+
 ## [0.3.2a9] - 2026-07-22
 
 - Use the idempotent query-reservation receipt as the runtime application
