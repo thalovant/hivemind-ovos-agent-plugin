@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.2a8] - 2026-07-22
+
+- Keep queries open through the authoritative OVOS skill-handler lifecycle so
+  delayed final replies cannot bleed into the next query on the same client.
+
 ## [0.3.2a3](https://github.com/JarbasHiveMind/hivemind-ovos-agent-plugin/tree/0.3.2a3) (2026-07-04)
 
 [Full Changelog](https://github.com/JarbasHiveMind/hivemind-ovos-agent-plugin/compare/0.3.2a2...0.3.2a3)

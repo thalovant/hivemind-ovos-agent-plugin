@@ -25,6 +25,11 @@ The plugin is configured by the `hivemind-core` `agent_protocol` block.
 | `delivery_probe_timeout` | number | `2` | Maximum seconds for each application-level runtime probe or receipt attempt. |
 | `delivery_recovery_timeout` | number | `20` | Total bounded window for exact, idempotent probe and query-receipt retries while the OVOS core consumer reconnects. |
 
+`query_timeout` bounds the complete skill-handler lifecycle. Intermediate
+speech does not close a query while an OVOS handler is still active; legacy
+and common-query paths without lifecycle events retain the bounded
+`query_reply_grace` settle fallback.
+
 If no `host`/`port` are supplied, the plugin falls back to the
 `websocket` section of the global OVOS `Configuration()`, which is also the standard
 location for OVOS bus client settings. This means an OVOS install that already has
