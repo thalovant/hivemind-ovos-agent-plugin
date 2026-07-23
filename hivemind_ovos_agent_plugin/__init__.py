@@ -1221,7 +1221,14 @@ class OVOSAgentProtocol(AgentProtocol):
                 # Explicit skill handlers can emit progress speech while their
                 # real work is still running. Their lifecycle is authoritative;
                 # the short settle fallback is only for paths without it.
-                if not handler_active:
+                # A scope-fallback reply proves the answer belongs to this
+                # query, but it also proves OVOS dropped the explicit query
+                # correlation.  The matching handler-complete event may be
+                # equally uncorrelated, so it cannot safely terminate this
+                # collector.  Bound that degraded path with the normal reply
+                # grace instead of retaining a listener worker until the full
+                # query timeout.
+                if not handler_active or used_scope_fallback:
                     reply_deadline = time.monotonic() + reply_grace
                 if preserve_messages:
                     yield chunk

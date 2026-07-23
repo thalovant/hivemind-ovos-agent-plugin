@@ -325,6 +325,52 @@ def test_context_query_accepts_reply_with_unique_site_scope():
     assert agent._active_query_scopes == {}
 
 
+def test_scope_fallback_reply_bounds_uncorrelated_handler_lifecycle():
+    agent = _agent()
+    agent.config = {
+        "query_timeout": 0.3,
+        "query_reply_grace": 0.01,
+    }
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        agent.bus.emit(Message(
+            "mycroft.skill.handler.start", {}, {"query_id": query_id}
+        ))
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "scope-correlated answer"},
+            {
+                "session": {"site_id": "customer-site"},
+                "skill_id": "scope.skill",
+            },
+        ))
+        # Some OVOS handlers omit all query scope from their completion event.
+        # The accepted reply must still release the HiveMind query worker.
+        agent.bus.emit(Message("mycroft.skill.handler.complete", {}, {}))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {
+            "source": "client::one",
+            "session": {
+                "session_id": "client-session",
+                "site_id": "customer-site",
+            },
+        },
+    )
+
+    started = time.monotonic()
+    chunks = list(agent.answer_query_message(admitted))
+
+    assert time.monotonic() - started < 0.15
+    assert chunks[0].data["utterance"] == "scope-correlated answer"
+    assert chunks[1] is None
+    assert agent._active_query_scopes == {}
+
+
 def test_context_query_accepts_reply_routed_to_unique_client_source():
     agent = _agent()
 
