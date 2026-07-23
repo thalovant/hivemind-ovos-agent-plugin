@@ -3,9 +3,9 @@
 ## [0.3.2a13] - 2026-07-23
 
 - Bound a handler lifecycle after accepting an uncorrelated reply through its
-  unique client scope, preventing the listener worker from remaining occupied
-  until the full query timeout when OVOS also omits correlation from the
-  handler-complete event.
+  unique admitted client or site scope, preventing the listener worker from
+  remaining occupied until the full query timeout when OVOS also omits
+  correlation from the handler-complete event.
 
 ## [0.3.2a12] - 2026-07-23
 

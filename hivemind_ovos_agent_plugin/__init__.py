@@ -1059,7 +1059,7 @@ class OVOSAgentProtocol(AgentProtocol):
                     return None
             return value
 
-        def _matches_query(msg):
+        def _matches_query(msg, *, mark_scope_fallback=False):
             nonlocal used_scope_fallback
             msg = _message(msg)
             if msg is None:
@@ -1076,7 +1076,7 @@ class OVOSAgentProtocol(AgentProtocol):
                 return False
             if not self._uniquely_matches_active_scope(msg, qid):
                 return False
-            if not used_scope_fallback:
+            if mark_scope_fallback and not used_scope_fallback:
                 LOG.info(
                     "Accepted OVOS reply through unique active query scope "
                     "after query correlation was omitted"
@@ -1086,7 +1086,9 @@ class OVOSAgentProtocol(AgentProtocol):
 
         def _on_speak(msg):
             msg = _message(msg)
-            if msg is None or not _matches_query(msg):
+            if msg is None or not _matches_query(
+                msg, mark_scope_fallback=True
+            ):
                 return
             data = msg.data if isinstance(msg.data, dict) else {}
             utterance = data.get("utterance", "")

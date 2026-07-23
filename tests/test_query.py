@@ -1,5 +1,5 @@
 import time
-from threading import Thread
+from threading import Thread, Timer
 from unittest.mock import MagicMock
 
 import pytest
@@ -368,6 +368,61 @@ def test_scope_fallback_reply_bounds_uncorrelated_handler_lifecycle():
     assert time.monotonic() - started < 0.15
     assert chunks[0].data["utterance"] == "scope-correlated answer"
     assert chunks[1] is None
+    assert agent._active_query_scopes == {}
+
+
+def test_scope_fallback_lifecycle_does_not_bound_correlated_reply():
+    agent = _agent()
+    agent.config = {
+        "query_timeout": 0.3,
+        "query_reply_grace": 0.01,
+    }
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        agent.bus.emit(Message(
+            "mycroft.skill.handler.start",
+            {},
+            {"session": {"site_id": "customer-site"}},
+        ))
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "intermediate answer"},
+            {"query_id": query_id, "skill_id": "scope.skill"},
+        ))
+
+        def finish():
+            agent.bus.emit(Message(
+                "speak",
+                {"utterance": "final answer"},
+                {"query_id": query_id, "skill_id": "scope.skill"},
+            ))
+            agent.bus.emit(Message(
+                "mycroft.skill.handler.complete", {}, {"query_id": query_id}
+            ))
+
+        Timer(0.03, finish).start()
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {
+            "source": "client::one",
+            "session": {
+                "session_id": "client-session",
+                "site_id": "customer-site",
+            },
+        },
+    )
+
+    chunks = list(agent.answer_query_message(admitted))
+
+    assert [chunk.data["utterance"] for chunk in chunks[:-1]] == [
+        "intermediate answer",
+        "final answer",
+    ]
+    assert chunks[-1] is None
     assert agent._active_query_scopes == {}
 
 
