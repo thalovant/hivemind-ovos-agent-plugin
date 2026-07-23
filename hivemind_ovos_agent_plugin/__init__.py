@@ -649,6 +649,9 @@ class OVOSAgentProtocol(AgentProtocol):
     _active_query_callbacks: Dict[str, Dict[str, Callable]] = dataclasses.field(
         default_factory=dict, init=False, repr=False
     )
+    _active_query_scope_index: Dict[str, Set[str]] = dataclasses.field(
+        default_factory=dict, init=False, repr=False
+    )
     _query_dispatcher_buses: Set[int] = dataclasses.field(
         default_factory=set, init=False, repr=False
     )
@@ -757,6 +760,8 @@ class OVOSAgentProtocol(AgentProtocol):
             self._active_query_scopes_lock = Lock()
         if not hasattr(self, "_active_query_callbacks"):
             self._active_query_callbacks = {}
+        if not hasattr(self, "_active_query_scope_index"):
+            self._active_query_scope_index = {}
         if not hasattr(self, "_query_dispatcher_buses"):
             self._query_dispatcher_buses = set()
             self._query_dispatcher_handlers = {}
@@ -808,13 +813,65 @@ class OVOSAgentProtocol(AgentProtocol):
             self._query_dispatcher_buses.add(bus_id)
 
     def _dispatch_active_query_event(self, event: str, message) -> None:
-        """Fan one immutable bus subscription into active query callbacks."""
+        """Route one immutable bus subscription to matching query callbacks.
+
+        A listener replica can have many queries in flight while every replica
+        receives the same runtime-bus lifecycle events.  Broadcasting every
+        event to every local query makes dispatch quadratic under load because
+        each callback repeats correlation and scope scans.  Prefer explicit
+        query identifiers, then the server-admitted client/site scope index.
+        Ambiguous or unrelated events cannot satisfy the existing unique-scope
+        correlation rule, so they intentionally invoke no query callback.
+        """
         self._ensure_query_correlation_state()
+        if isinstance(message, str):
+            try:
+                indexed_message = Message.deserialize(message)
+            except Exception:
+                indexed_message = None
+        else:
+            indexed_message = message
+
         with self._active_query_scopes_lock:
+            active_ids = set(self._active_query_callbacks)
+            identifiers = (
+                self._message_query_ids(indexed_message)
+                if indexed_message is not None else set()
+            )
+            candidates = identifiers.intersection(active_ids)
+            if not candidates and indexed_message is not None:
+                tokens = self._query_scope_tokens(
+                    getattr(indexed_message, "context", None), response=True
+                )
+                client_tokens = {
+                    token for token in tokens
+                    if token.startswith(("peer:", "client:"))
+                }
+                candidates = {
+                    query_id
+                    for token in client_tokens
+                    for query_id in self._active_query_scope_index.get(
+                        token, set()
+                    )
+                }
+                if not candidates:
+                    site_tokens = {
+                        token for token in tokens
+                        if token.startswith("site:")
+                    }
+                    candidates = {
+                        query_id
+                        for token in site_tokens
+                        for query_id in self._active_query_scope_index.get(
+                            token, set()
+                        )
+                    }
+                if len(candidates) != 1:
+                    candidates = set()
             callbacks = [
-                handlers.get(event)
-                for handlers in self._active_query_callbacks.values()
-                if handlers.get(event) is not None
+                self._active_query_callbacks[query_id].get(event)
+                for query_id in candidates
+                if self._active_query_callbacks[query_id].get(event) is not None
             ]
         for callback in callbacks:
             try:
@@ -887,14 +944,31 @@ class OVOSAgentProtocol(AgentProtocol):
         self._ensure_query_correlation_state()
         tokens = self._query_scope_tokens(context)
         with self._active_query_scopes_lock:
+            previous = self._active_query_scopes.get(query_id, set())
+            for token in previous:
+                query_ids = self._active_query_scope_index.get(token)
+                if query_ids is not None:
+                    query_ids.discard(query_id)
+                    if not query_ids:
+                        self._active_query_scope_index.pop(token, None)
             self._active_query_scopes[query_id] = tokens
             self._active_query_callbacks[query_id] = dict(callbacks or {})
+            for token in tokens:
+                self._active_query_scope_index.setdefault(token, set()).add(
+                    query_id
+                )
 
     def _unregister_active_query(self, query_id: str) -> None:
         self._ensure_query_correlation_state()
         with self._active_query_scopes_lock:
-            self._active_query_scopes.pop(query_id, None)
+            tokens = self._active_query_scopes.pop(query_id, set())
             self._active_query_callbacks.pop(query_id, None)
+            for token in tokens:
+                query_ids = self._active_query_scope_index.get(token)
+                if query_ids is not None:
+                    query_ids.discard(query_id)
+                    if not query_ids:
+                        self._active_query_scope_index.pop(token, None)
 
     def _uniquely_matches_active_scope(self, message: Message,
                                        query_id: str) -> bool:
@@ -911,9 +985,10 @@ class OVOSAgentProtocol(AgentProtocol):
             }
             candidates = {
                 candidate_id
-                for candidate_id, candidate_tokens
-                in self._active_query_scopes.items()
-                if candidate_tokens.intersection(client_tokens)
+                for token in client_tokens
+                for candidate_id in self._active_query_scope_index.get(
+                    token, set()
+                )
             }
             # A server-admitted client route is more specific than a site:
             # many identities may legitimately share one site during load.
@@ -923,9 +998,10 @@ class OVOSAgentProtocol(AgentProtocol):
                 }
                 candidates = {
                     candidate_id
-                    for candidate_id, candidate_tokens
-                    in self._active_query_scopes.items()
-                    if candidate_tokens.intersection(site_tokens)
+                    for token in site_tokens
+                    for candidate_id in self._active_query_scope_index.get(
+                        token, set()
+                    )
                 }
         return candidates == {query_id}
 
