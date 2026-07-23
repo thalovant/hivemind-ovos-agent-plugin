@@ -1059,7 +1059,7 @@ class OVOSAgentProtocol(AgentProtocol):
                     return None
             return value
 
-        def _matches_query(msg):
+        def _matches_query(msg, *, mark_scope_fallback=False):
             nonlocal used_scope_fallback
             msg = _message(msg)
             if msg is None:
@@ -1076,7 +1076,7 @@ class OVOSAgentProtocol(AgentProtocol):
                 return False
             if not self._uniquely_matches_active_scope(msg, qid):
                 return False
-            if not used_scope_fallback:
+            if mark_scope_fallback and not used_scope_fallback:
                 LOG.info(
                     "Accepted OVOS reply through unique active query scope "
                     "after query correlation was omitted"
@@ -1086,7 +1086,9 @@ class OVOSAgentProtocol(AgentProtocol):
 
         def _on_speak(msg):
             msg = _message(msg)
-            if msg is None or not _matches_query(msg):
+            if msg is None or not _matches_query(
+                msg, mark_scope_fallback=True
+            ):
                 return
             data = msg.data if isinstance(msg.data, dict) else {}
             utterance = data.get("utterance", "")
@@ -1221,7 +1223,14 @@ class OVOSAgentProtocol(AgentProtocol):
                 # Explicit skill handlers can emit progress speech while their
                 # real work is still running. Their lifecycle is authoritative;
                 # the short settle fallback is only for paths without it.
-                if not handler_active:
+                # A scope-fallback reply proves the answer belongs to this
+                # query, but it also proves OVOS dropped the explicit query
+                # correlation.  The matching handler-complete event may be
+                # equally uncorrelated, so it cannot safely terminate this
+                # collector.  Bound that degraded path with the normal reply
+                # grace instead of retaining a listener worker until the full
+                # query timeout.
+                if not handler_active or used_scope_fallback:
                     reply_deadline = time.monotonic() + reply_grace
                 if preserve_messages:
                     yield chunk
