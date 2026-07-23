@@ -614,4 +614,84 @@ def test_sequential_queries_keep_runtime_bus_subscriptions_immutable():
     agent.bus.remove.assert_not_called()
     assert agent._active_query_scopes == {}
     assert agent._active_query_callbacks == {}
+    assert agent._active_query_scope_index == {}
     assert len(agent._query_dispatcher_buses) == 1
+
+
+def test_query_dispatch_uses_explicit_identifier_without_fanout():
+    """One correlated event must not scan every active query callback."""
+    agent = _agent()
+    callbacks = [MagicMock() for _ in range(1000)]
+    for index, callback in enumerate(callbacks):
+        query_id = f"query-{index}"
+        agent._register_active_query(
+            query_id,
+            {"source": f"client-{index}"},
+            {"speak": callback},
+        )
+
+    message = Message(
+        "speak",
+        {"utterance": "ready"},
+        {"query_id": "query-731", "session": {"session_id": "query-731"}},
+    )
+    agent._dispatch_active_query_event("speak", message)
+
+    callbacks[731].assert_called_once_with(message)
+    assert sum(callback.call_count for callback in callbacks) == 1
+
+
+def test_query_dispatch_uses_unique_client_scope_without_fanout():
+    """A legacy response without query_id uses the indexed admitted route."""
+    agent = _agent()
+    first = MagicMock()
+    second = MagicMock()
+    agent._register_active_query(
+        "query-one", {"source": "client-one"}, {"speak": first}
+    )
+    agent._register_active_query(
+        "query-two", {"source": "client-two"}, {"speak": second}
+    )
+    message = Message(
+        "speak", {"utterance": "ready"}, {"destination": "client-two"}
+    )
+
+    agent._dispatch_active_query_event("speak", message)
+
+    first.assert_not_called()
+    second.assert_called_once_with(message)
+
+
+def test_query_dispatch_rejects_ambiguous_scope_without_fanout():
+    """A shared site cannot correlate a response to either active query."""
+    agent = _agent()
+    first = MagicMock()
+    second = MagicMock()
+    shared = {"session": {"site_id": "shared-site"}}
+    agent._register_active_query("query-one", shared, {"speak": first})
+    agent._register_active_query("query-two", shared, {"speak": second})
+    message = Message(
+        "speak",
+        {"utterance": "ambiguous"},
+        {"session": {"site_id": "shared-site"}},
+    )
+
+    agent._dispatch_active_query_event("speak", message)
+
+    first.assert_not_called()
+    second.assert_not_called()
+
+
+def test_query_scope_index_is_removed_with_query():
+    agent = _agent()
+    agent._register_active_query(
+        "query-one",
+        {"source": "client-one", "session": {"site_id": "site-one"}},
+        {"speak": MagicMock()},
+    )
+
+    agent._unregister_active_query("query-one")
+
+    assert agent._active_query_scopes == {}
+    assert agent._active_query_callbacks == {}
+    assert agent._active_query_scope_index == {}

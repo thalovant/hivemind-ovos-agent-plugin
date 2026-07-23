@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.2a12] - 2026-07-23
+
+- Index active query callbacks by explicit query and admitted client scope so
+  each runtime-bus lifecycle event reaches only its matching query instead of
+  producing quadratic listener work under concurrent traffic.
+
 ## [0.3.2a11] - 2026-07-22
 
 - Keep runtime-bus event subscriptions immutable while queries are active and
