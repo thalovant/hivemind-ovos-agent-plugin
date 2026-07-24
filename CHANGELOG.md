@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.2a14] - 2026-07-24
+
+- Keep runtime query-reservation and pipeline-start receipt subscriptions
+  immutable, dispatching concurrent receipts by exact query ID without
+  mutating pyee handlers from query workers.
+
 ## [0.3.2a13] - 2026-07-23
 
 - Bound a handler lifecycle after accepting an uncorrelated reply through its
