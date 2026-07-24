@@ -100,6 +100,10 @@ class _RuntimeMessageBusClient(MessageBusClient):
         self._disconnect_escalated = False
         self._reconnect_state_lock = Lock()
         self._send_lock = Lock()
+        self._query_receipt_events = {}
+        self._query_receipt_lock = Lock()
+        self._query_receipt_dispatchers = {}
+        self._query_receipt_dispatcher_setup_lock = Lock()
         self._reconnect_worker = None
         self._reconnect_error = None
         self._close_requested = False
@@ -119,6 +123,10 @@ class _RuntimeMessageBusClient(MessageBusClient):
         if self._ping_timeout >= self._ping_interval:
             self._ping_timeout = max(1.0, self._ping_interval / 2)
         super().__init__(*args, **kwargs)
+        # Install the fixed receipt topology before the websocket receive
+        # thread starts. Query workers must never mutate pyee registrations
+        # while that thread is dispatching a runtime response.
+        self._ensure_query_receipt_dispatchers()
 
     @staticmethod
     def _positive_float(value, default):
@@ -168,6 +176,82 @@ class _RuntimeMessageBusClient(MessageBusClient):
             self._close_requested = False
         if not hasattr(self, "_send_lock"):
             self._send_lock = Lock()
+
+    def _ensure_query_receipt_dispatchers(self):
+        """Install immutable query-receipt handlers exactly once per bus."""
+        if not hasattr(self, "_query_receipt_events"):
+            self._query_receipt_events = {}
+            self._query_receipt_lock = Lock()
+            self._query_receipt_dispatchers = {}
+            self._query_receipt_dispatcher_setup_lock = Lock()
+        with self._query_receipt_dispatcher_setup_lock:
+            if self._query_receipt_dispatchers:
+                return
+            def dispatch(event_type):
+                def _handler(response):
+                    self._dispatch_query_receipt(event_type, response)
+                return _handler
+
+            installed = []
+            for response_type in (
+                    "thalovant.runtime.query.prepared",
+                    "thalovant.runtime.query.started"):
+                callback = dispatch(response_type)
+                try:
+                    self.emitter.on(response_type, callback)
+                except Exception:
+                    for installed_type, installed_callback in reversed(
+                            installed):
+                        try:
+                            self.emitter.remove_listener(
+                                installed_type, installed_callback
+                            )
+                        except Exception:
+                            pass
+                    raise
+                installed.append((response_type, callback))
+            self._query_receipt_dispatchers = dict(installed)
+
+    def _dispatch_query_receipt(self, response_type, response):
+        """Wake only waiters for the exact query receipt."""
+        if (not isinstance(response, Message)
+                or not isinstance(response.data, dict)):
+            return
+        query_id = response.data.get("query_id")
+        if not isinstance(query_id, str) or not query_id:
+            return
+        with self._query_receipt_lock:
+            waiters = tuple(
+                self._query_receipt_events.get(
+                    (response_type, query_id), ()
+                )
+            )
+        for waiter in waiters:
+            waiter.set()
+
+    def _register_query_receipt(self, response_type, query_id):
+        """Register one query worker without changing emitter topology."""
+        self._ensure_query_receipt_dispatchers()
+        received = Event()
+        with self._query_receipt_lock:
+            self._query_receipt_events.setdefault(
+                (response_type, query_id), set()
+            ).add(received)
+        return received
+
+    def _unregister_query_receipt(self, response_type, query_id, received):
+        """Remove one waiter from the agent-owned receipt registry."""
+        with self._query_receipt_lock:
+            waiters = self._query_receipt_events.get(
+                (response_type, query_id)
+            )
+            if waiters is None:
+                return
+            waiters.discard(received)
+            if not waiters:
+                self._query_receipt_events.pop(
+                    (response_type, query_id), None
+                )
 
     def _close_stale_transport(self, transport):
         """Wake one stale websocket without blocking a query or supervisor.
@@ -438,16 +522,10 @@ class _RuntimeMessageBusClient(MessageBusClient):
         # caller's complete query timeout.
         deadline = time.monotonic() + recovery_timeout
         for request, response_type, stage in stages:
-            received = Event()
+            received = self._register_query_receipt(
+                response_type, query_id
+            )
             reconnected = False
-
-            def _on_receipt(response):
-                if (isinstance(response, Message)
-                        and isinstance(response.data, dict)
-                        and response.data.get("query_id") == query_id):
-                    received.set()
-
-            self.emitter.on(response_type, _on_receipt)
             try:
                 while True:
                     remaining = deadline - time.monotonic()
@@ -493,10 +571,9 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     LOG.error("%s", last_error)
                     raise last_error
             finally:
-                try:
-                    self.emitter.remove_listener(response_type, _on_receipt)
-                except (KeyError, ValueError):
-                    pass
+                self._unregister_query_receipt(
+                    response_type, query_id, received
+                )
 
     def ensure_delivery_path(self, probe_timeout=2):
         """Reconnect a half-open bus before emitting a user utterance.

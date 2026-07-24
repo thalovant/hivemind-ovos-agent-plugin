@@ -469,6 +469,71 @@ def test_confirmed_query_accepts_exact_post_transform_receipt():
     assert client.client.send.call_count == 2
 
 
+def test_concurrent_confirmed_queries_keep_receipt_subscriptions_immutable():
+    """Concurrent receipts dispatch by query ID without pyee mutations."""
+    client = _client()
+    client._message_send_timeout = 1
+    client._delivery_recovery_timeout = 1
+    client.emitter = EventEmitter()
+    client._ensure_query_receipt_dispatchers()
+    client.emitter.on = MagicMock(
+        side_effect=AssertionError("query workers must not add handlers")
+    )
+    client.emitter.remove_listener = MagicMock(
+        side_effect=AssertionError("query workers must not remove handlers")
+    )
+
+    def acknowledge(payload):
+        request = Message.deserialize(payload)
+        if request.msg_type == "thalovant.runtime.query.prepare":
+            response_type = "thalovant.runtime.query.prepared"
+            query_id = request.data["query_id"]
+        else:
+            response_type = "thalovant.runtime.query.started"
+            query_id = request.context["query_id"]
+        client.emitter.emit(
+            response_type,
+            request.reply(response_type, {"query_id": query_id}),
+        )
+
+    client.client.send.side_effect = acknowledge
+    completed = []
+    errors = []
+    result_lock = Lock()
+
+    def deliver(index):
+        query_id = f"query-{index}"
+        try:
+            client.emit_confirmed(
+                Message(
+                    "recognizer_loop:utterance",
+                    {"utterances": ["hello"]},
+                    {"query_id": query_id},
+                ),
+                acceptance_timeout=0.5,
+                recovery_timeout=1,
+            )
+            with result_lock:
+                completed.append(query_id)
+        except Exception as exc:  # pragma: no cover - asserted below
+            with result_lock:
+                errors.append(exc)
+
+    workers = [Thread(target=deliver, args=(index,)) for index in range(25)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=3)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert len(completed) == 25
+    assert client.client.send.call_count == 50
+    client.emitter.on.assert_not_called()
+    client.emitter.remove_listener.assert_not_called()
+    assert client._query_receipt_events == {}
+
+
 def test_confirmed_query_retries_until_the_runtime_consumer_recovers(monkeypatch):
     """Keep retrying the exact frame after one reconnect until core returns."""
     client = _client()
