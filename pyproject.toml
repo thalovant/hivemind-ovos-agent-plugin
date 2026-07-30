@@ -17,6 +17,7 @@ dependencies = [
     # get_bus() health checks authoritative before Core emits client traffic.
     "ovos-bus-client>=2.6.5a1,<3.0.0",
     "ovos-config>=0.0.12,<3.0.0",
+    "ovos-spec-tools>=1.5.1a2,<2.0.0",
     "ovos-utils>=0.8.2,<1.0.0",
     "hivemind-bus-client>=0.7.0a2,<1.0.0",
     "hivemind-plugin-manager>=0.8.0a1,<1.0.0",
