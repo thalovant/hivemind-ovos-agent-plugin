@@ -11,6 +11,7 @@ from ovos_bus_client import MessageBusClient
 from ovos_bus_client.client.client import _maybe_encrypt
 from ovos_bus_client.message import Message
 from ovos_config import Configuration
+from ovos_spec_tools.session import SESSION1_REGISTERED_FIELDS
 from ovos_utils import json_dumps
 from ovos_utils.fakebus import FakeBus
 from ovos_utils.log import LOG
@@ -1360,6 +1361,15 @@ class OVOSAgentProtocol(AgentProtocol):
             target_peers = [target_peers]
 
         if target_peers:
+            session = message.context.get("session")
+            if isinstance(session, dict):
+                # OVOS-SESSION-1 §2.1 requires registered null fields to be
+                # omitted. Preserve unknown extension fields verbatim (§2.4).
+                message.context["session"] = {
+                    key: value
+                    for key, value in session.items()
+                    if value is not None or key not in SESSION1_REGISTERED_FIELDS
+                }
             for peer, client in list(self.clients.items()):
                 if peer in target_peers:
                     LOG.debug(f"{message.msg_type} - destination: {peer}")
