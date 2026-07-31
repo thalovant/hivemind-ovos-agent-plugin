@@ -93,3 +93,32 @@ class TestClientIsolation:
 
         sent = alice.send.call_args[0][0]
         assert sent.payload.context.get("source") == "hive"
+
+    def test_forwarded_message_omits_registered_null_session_fields(
+        self, agent, make_client
+    ):
+        alice = make_client("ws://alice")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+        message = Message(
+            "ovos.utterance.speak",
+            {"utterance": "hi"},
+            {
+                "destination": "ws://alice",
+                "session": {
+                    "session_id": "session-1",
+                    "lang": None,
+                    "persona_id": None,
+                    "site_id": "kitchen",
+                    "future_field": None,
+                },
+            },
+        )
+
+        agent.handle_internal_mycroft(message.serialize())
+
+        session = alice.send.call_args[0][0].payload.context["session"]
+        assert session == {
+            "session_id": "session-1",
+            "site_id": "kitchen",
+            "future_field": None,
+        }
