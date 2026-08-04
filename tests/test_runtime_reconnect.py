@@ -574,7 +574,7 @@ def test_confirmed_query_retries_until_the_runtime_consumer_recovers(monkeypatch
         client, "_wait_for_live_transport", MagicMock(return_value=True)
     )
 
-    client.emit_confirmed(message, 0.01)
+    client.emit_confirmed(message, 0.01, recovery_timeout=0.2)
 
     assert payloads[0] == payloads[1] == payloads[2]
     client._schedule_reconnect.assert_called_once()
