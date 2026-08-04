@@ -73,6 +73,26 @@ class TestBusRegistration:
         assert agent.wait_for_bus(2.5) is True
         bus.connected_event.wait.assert_called_once_with(2.5)
 
+    def test_wait_for_bus_uses_configured_default_timeout(self, agent):
+        bus = MagicMock()
+        bus.connected_event.wait.return_value = True
+        agent.bus = agent._owned_bus = bus
+        agent.config = {"connection_timeout": 3}
+
+        assert agent.wait_for_bus() is True
+        bus.connected_event.wait.assert_called_once_with(3.0)
+
+    @pytest.mark.parametrize("timeout", ["invalid", float("inf"), -1])
+    def test_wait_for_bus_normalizes_invalid_explicit_timeout(self, agent,
+                                                              timeout):
+        bus = MagicMock()
+        bus.connected_event.wait.return_value = True
+        agent.bus = agent._owned_bus = bus
+        agent.config = {"connection_timeout": 10}
+
+        assert agent.wait_for_bus(timeout) is True
+        bus.connected_event.wait.assert_called_once_with(10.0)
+
     @pytest.mark.parametrize("raw", [None, "invalid", float("inf"), -1])
     def test_invalid_connection_timeout_uses_safe_default(self, agent, raw):
         agent.config = {"connection_timeout": raw}

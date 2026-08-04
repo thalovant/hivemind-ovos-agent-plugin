@@ -791,14 +791,18 @@ class OVOSAgentProtocol(AgentProtocol):
         self.bus.on("hive.send.downstream", self.handle_send)
         self.bus.on("message", self.handle_internal_mycroft)  # catch all
 
-    def _connection_timeout(self) -> float:
-        """Return a finite, non-negative startup wait."""
-        raw = self.config.get("connection_timeout", 10)
+    @staticmethod
+    def _normalize_timeout(raw, default: float = 10.0) -> float:
+        """Return a finite, non-negative timeout."""
         try:
             timeout = float(raw)
         except (TypeError, ValueError):
-            return 10.0
-        return timeout if math.isfinite(timeout) and timeout >= 0 else 10.0
+            return default
+        return timeout if math.isfinite(timeout) and timeout >= 0 else default
+
+    def _connection_timeout(self) -> float:
+        """Return a finite, non-negative startup wait."""
+        return self._normalize_timeout(self.config.get("connection_timeout", 10))
 
     def get_bus(self, client=None) -> FakeBus | MessageBusClient:
         """Return a usable bus without blocking Core's shared IOLoop thread."""
@@ -813,6 +817,8 @@ class OVOSAgentProtocol(AgentProtocol):
             return True
         if timeout is None:
             timeout = self._connection_timeout()
+        else:
+            timeout = self._normalize_timeout(timeout)
         return self.bus.connected_event.wait(timeout)
 
     def _send_to_client(self, peer: str, client, hmessage: HiveMessage) -> bool:
