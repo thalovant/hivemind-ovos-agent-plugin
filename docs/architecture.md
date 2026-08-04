@@ -37,8 +37,9 @@ It owns exactly three responsibilities:
    `HiveMessageType.BUS` message and forward to that peer — and **only** that peer.
 3. **Runtime selection**: when explicitly configured with independent runtime shards,
    return the one rendezvous-hashed bus for a client through the documented
-   `AgentProtocol.get_bus(client)` contract. HiveMind Core still owns emission; the
-   agent neither intercepts nor rewrites upstream traffic.
+   `AgentProtocol.get_bus(client)` contract, and use the same selection for the
+   client-aware `AgentProtocol.answer_query(...)` path. HiveMind Core still owns
+   ordinary BUS-message emission; the agent neither intercepts nor rewrites it.
 
 It does **not** own:
 
@@ -48,8 +49,10 @@ It does **not** own:
   This package contributes `OVOSAgentPolicy` (entry point `hivemind.policy /
   hivemind-ovos-agent-policy`) to that chain; see [`policy.md`](policy.md).
 - Binary payload routing — handled by a separate `BinaryDataHandlerProtocol` plugin.
-- Upstream traffic (client → OVOS bus) — `hivemind-core` emits it directly on the
-  bus returned by `get_bus(client)`.
+- Ordinary upstream BUS traffic (client → OVOS bus) — `hivemind-core` emits it
+  directly on the bus returned by `get_bus(client)`. QUERY/CASCADE execution uses
+  the AgentProtocol query contract and is therefore emitted by the selected agent
+  backend.
 
 ## Why this lives in its own package
 

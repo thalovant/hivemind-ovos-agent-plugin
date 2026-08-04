@@ -8,7 +8,10 @@ from hivemind_plugin_manager.protocols import ClientCallbacks
 from ovos_bus_client.message import Message
 from ovos_utils.fakebus import FakeBus
 
-from hivemind_ovos_agent_plugin import OVOSAgentProtocol
+from hivemind_ovos_agent_plugin import (
+    OVOSAgentProtocol,
+    _RuntimeMessageBusClient,
+)
 
 
 def _sharded_agent():
@@ -77,6 +80,17 @@ class TestShardConfiguration:
         with pytest.raises(ValueError, match="endpoints must be unique"):
             agent._configured_runtime_shards()
 
+    def test_equivalent_dns_endpoint_aliases_are_rejected(self, agent):
+        agent.config = {
+            "runtime_shards": [
+                {"id": "runtime-a", "host": "Runtime-A.Internal"},
+                {"id": "runtime-b", "host": "runtime-a.internal."},
+            ]
+        }
+
+        with pytest.raises(ValueError, match="endpoints must be unique"):
+            agent._configured_runtime_shards()
+
     @pytest.mark.parametrize(
         "runtime_shards, error",
         [
@@ -135,6 +149,21 @@ class TestShardOwnership:
 
         assert selected == {first, second}
 
+    def test_four_hundred_clients_are_distributed_across_sixteen_shards(self):
+        agent, _, _ = _sharded_agent()
+        agent._runtime_buses = {
+            f"runtime-{index}": FakeBus()
+            for index in range(16)
+        }
+        counts = {bus: 0 for bus in agent._runtime_buses.values()}
+
+        for index in range(400):
+            bus = agent._runtime_bus_for_key(f"VoiceSatellite::{index}")
+            counts[bus] += 1
+
+        assert min(counts.values()) > 0
+        assert max(counts.values()) - min(counts.values()) <= 20
+
     def test_unavailable_selected_shard_fails_without_remapping(self, agent):
         first = MagicMock()
         second = MagicMock()
@@ -150,6 +179,44 @@ class TestShardOwnership:
             agent.get_bus(_client(peer))
 
         second.connected_event.is_set.assert_not_called()
+
+    def test_wait_for_bus_requires_every_shard_transport(self, agent):
+        first = MagicMock(spec=_RuntimeMessageBusClient)
+        second = MagicMock(spec=_RuntimeMessageBusClient)
+        first._wait_for_live_transport.return_value = True
+        second._wait_for_live_transport.return_value = False
+        agent._owned_bus = first
+        agent._owned_buses = (first, second)
+
+        assert agent.wait_for_bus(0.5) is False
+        first._wait_for_live_transport.assert_called_once()
+        second._wait_for_live_transport.assert_called_once()
+
+    def test_public_answer_query_uses_client_shard(self, monkeypatch):
+        agent, first, _ = _sharded_agent()
+        peer = _peer_for(agent, first)
+        observed = {}
+
+        def stream(utterance, lang, **kwargs):
+            observed.update(
+                utterance=utterance,
+                lang=lang,
+                bus=kwargs.get("bus"),
+            )
+            yield "answer"
+            yield None
+
+        monkeypatch.setattr(agent, "_stream_query", stream)
+
+        assert list(agent.answer_query("hello", "en-US", _client(peer))) == [
+            "answer",
+            None,
+        ]
+        assert observed == {
+            "utterance": "hello",
+            "lang": "en-US",
+            "bus": first,
+        }
 
 
 def _peer_for_raw_assignment(agent, expected_bus):

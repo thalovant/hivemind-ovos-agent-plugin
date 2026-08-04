@@ -992,7 +992,10 @@ class OVOSAgentProtocol(AgentProtocol):
                 )
             if shard_id in shard_ids:
                 raise ValueError(f"duplicate runtime shard id: {shard_id}")
-            endpoint = (host, port)
+            # DNS hostnames are case-insensitive and an absolute trailing dot
+            # names the same endpoint. Reject those obvious aliases instead
+            # of opening two receivers on one broadcast messagebus.
+            endpoint = (host.casefold().rstrip("."), port)
             if endpoint in endpoints:
                 raise ValueError(
                     "runtime_shards endpoints must be unique; repeated "
@@ -1146,6 +1149,13 @@ class OVOSAgentProtocol(AgentProtocol):
             timeout = self._connection_timeout()
         else:
             timeout = self._normalize_timeout(timeout)
+        if len(owned) == 1:
+            bus = owned[0]
+            if isinstance(bus, _RuntimeMessageBusClient):
+                return bus._wait_for_live_transport(
+                    time.monotonic() + timeout
+                )
+            return bus.connected_event.wait(timeout)
         deadline = time.monotonic() + timeout
         for bus in owned:
             if isinstance(bus, _RuntimeMessageBusClient):
@@ -1182,6 +1192,21 @@ class OVOSAgentProtocol(AgentProtocol):
         ``speak`` replies until ``ovos.utterance.handled`` (or 10s inactivity),
         correlated by a fresh query-scoped session so they are not reverse-routed."""
         yield from self._stream_query(utterance, lang)
+
+    def answer_query(self, utterance: str, lang: str,
+                     client=None) -> "Iterator[Optional[str]]":
+        """Stream a QUERY answer from the originating client's runtime.
+
+        This is the client-aware ``AgentProtocol`` contract. Keeping routing
+        here ensures direct users of the public plugin API receive the same
+        shard ownership as HiveMind Core's richer ``answer_query_message``
+        path.
+        """
+        yield from self._stream_query(
+            utterance,
+            lang,
+            bus=self.get_bus(client),
+        )
 
     def answer_query_message(self, message: Message,
                              client=None) -> "Iterator[Optional[Any]]":
