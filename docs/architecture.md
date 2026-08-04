@@ -27,7 +27,7 @@ This plugin is the **bridge** between `hivemind-core` and a running OVOS bus. It
 loaded by `hivemind-core` via the `hivemind.agent.protocol` entry point group and
 fulfils the `AgentProtocol` contract from `hivemind-plugin-manager`.
 
-It owns exactly two responsibilities:
+It owns exactly three responsibilities:
 
 1. **Downstream dispatch**: when an OVOS component emits `hive.send.downstream` on the
    OVOS bus, forward the payload to the correct HiveMind client (or fan out for
@@ -35,6 +35,10 @@ It owns exactly two responsibilities:
 2. **Response routing with client isolation**: when any internal OVOS bus message has
    `context["destination"]` set to a connected HiveMind peer, wrap it as a
    `HiveMessageType.BUS` message and forward to that peer — and **only** that peer.
+3. **Runtime selection**: when explicitly configured with independent runtime shards,
+   return the one rendezvous-hashed bus for a client through the documented
+   `AgentProtocol.get_bus(client)` contract. HiveMind Core still owns emission; the
+   agent neither intercepts nor rewrites upstream traffic.
 
 It does **not** own:
 
@@ -44,8 +48,8 @@ It does **not** own:
   This package contributes `OVOSAgentPolicy` (entry point `hivemind.policy /
   hivemind-ovos-agent-policy`) to that chain; see [`policy.md`](policy.md).
 - Binary payload routing — handled by a separate `BinaryDataHandlerProtocol` plugin.
-- Upstream traffic (client → OVOS bus) — that is `hivemind-core`'s direct
-  responsibility, not the agent protocol's.
+- Upstream traffic (client → OVOS bus) — `hivemind-core` emits it directly on the
+  bus returned by `get_bus(client)`.
 
 ## Why this lives in its own package
 
@@ -80,11 +84,30 @@ hivemind-ovos-agent-plugin   <- depends on all of the above; nothing depends on 
 
 ## Threading
 
-The plugin runs the OVOS bus client on its own background thread. Application
-writes enter one bounded FIFO queue and a single writer drains that queue, so
-HiveMind workers never contend inside `websocket-client` or wait indefinitely
-behind a disconnected transport. A disconnected bus and a full queue both fail
-immediately. Registered receive handlers still execute on the bus thread.
+The plugin runs each OVOS bus client on its own background thread. Each runtime
+has one bounded FIFO writer, so HiveMind workers never contend inside
+`websocket-client` or wait indefinitely behind a disconnected transport. A
+disconnected selected shard and a full queue both fail immediately. Registered
+receive handlers still execute on their corresponding bus thread.
+
+## Runtime sharding
+
+Runtime sharding is opt-in and requires an explicit list of unique, independently
+isolated messagebus endpoints. A repeated connection to one broadcast bus is not a
+shard: every receiver would observe the same `speak` frame and could produce duplicate
+audio. The plugin therefore rejects both repeated endpoint tuples and the ambiguous
+legacy `pool_size > 1` shape.
+
+For a valid shard set, rendezvous hashing maps the admitted HiveMind peer to exactly one
+runtime. The mapping is deterministic across listener processes and stable while shard
+membership is unchanged. If that runtime is unavailable, the request fails immediately;
+it is not replayed on another runtime because the first runtime may already have accepted
+it. Runtime replies are accepted only by the bus that owns their destination peer, and a
+bounded short-lived guard suppresses exact repeated correlated replies.
+
+This mode distributes independent skill requests. It does not turn one HiveMind server
+into a shared active-active relay: client registries, HiveMapper routes, and query/cascade
+collectors remain process-local as documented by HiveMind Core.
 
 The `self.clients` mapping is owned by `HiveMindListenerProtocol`; fan-out reads
 a stable item snapshot because connect and disconnect callbacks may mutate that

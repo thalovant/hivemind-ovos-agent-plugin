@@ -25,6 +25,9 @@ The plugin is configured by the `hivemind-core` `agent_protocol` block.
 | `ping_timeout` | number | `5` | Seconds to wait for a runtime-bus pong; must be below `ping_interval`. |
 | `delivery_probe_timeout` | number | `2` | Maximum seconds for each application-level runtime probe or receipt attempt. |
 | `delivery_recovery_timeout` | number | `20` | Maximum shared window for exact, idempotent query reservation and post-transform pipeline start while the OVOS core consumer reconnects. The effective query-delivery budget is also capped at half of `query_timeout`. |
+| `runtime_shards` | array | unset | Named, unique OVOS messagebus endpoints used for deterministic client-to-runtime routing. Maximum 64. |
+| `reply_dedupe_seconds` | number | `5` | Short window for suppressing an exact repeated correlated public reply in sharded mode. |
+| `reply_dedupe_max_entries` | integer | `8192` | Bounded correlated-reply fingerprints retained across shards. Maximum 65536. |
 
 `query_timeout` bounds delivery and the complete skill-handler lifecycle.
 Confirmed queries use their post-transform pipeline receipt as the
@@ -39,6 +42,32 @@ If no `host`/`port` are supplied, the plugin falls back to the
 `websocket` section of the global OVOS `Configuration()`, which is also the standard
 location for OVOS bus client settings. This means an OVOS install that already has
 `mycroft.conf` configured will work without any extra config in `hivemind-core`.
+
+## Independent runtime shards
+
+Use `runtime_shards` only when every hostname reaches a different OVOS runtime and
+messagebus. Hostnames must be explicit and unique; a shared ClusterIP service is not an
+independent endpoint.
+
+```json
+{
+  "agent_protocol": {
+    "hivemind-ovos-agent-plugin": {
+      "runtime_shards": [
+        {"id": "runtime-0", "host": "runtime-0.runtime-headless"},
+        {"id": "runtime-1", "host": "runtime-1.runtime-headless"}
+      ],
+      "port": 8181
+    }
+  }
+}
+```
+
+The shard ID and endpoint tuple must each be unique. Client routing uses the stable peer
+identity and rendezvous hashing. An unavailable selected shard produces
+`backend_unavailable`; the agent does not retry the request on another shard. The old
+`pool_size > 1` configuration is rejected because it cannot prove that separate
+connections terminate on separate broadcast buses.
 
 ## Reusing an existing bus connection
 
