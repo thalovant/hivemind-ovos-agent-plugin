@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import logging
 from threading import Lock
 from typing import Dict, Iterable
+
+from ovos_utils.log import LOG
 
 
 DEFAULT_BUCKETS_MS = (
@@ -25,7 +26,6 @@ class LatencyHistogram:
         self._sum_ms = 0.0
         self._log_every = max(0, int(log_every))
         self._lock = Lock()
-        self._logger = logging.getLogger(__name__)
 
     def observe_ms(self, elapsed_ms: float) -> None:
         """Record one non-negative latency observation in milliseconds."""
@@ -41,7 +41,7 @@ class LatencyHistogram:
             )
         if should_log:
             snapshot = self.snapshot()
-            self._logger.info(
+            LOG.info(
                 "latency_histogram name=%s count=%d sum_ms=%.3f buckets=%s",
                 self.name,
                 snapshot["count"],
