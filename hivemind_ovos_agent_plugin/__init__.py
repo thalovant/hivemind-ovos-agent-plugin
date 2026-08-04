@@ -841,6 +841,12 @@ class OVOSAgentProtocol(AgentProtocol):
     _query_dispatcher_setup_lock: Lock = dataclasses.field(
         default_factory=Lock, init=False, repr=False
     )
+    _skill_handler_starts: Dict[str, float] = dataclasses.field(
+        default_factory=dict, init=False, repr=False
+    )
+    _skill_handler_starts_lock: Lock = dataclasses.field(
+        default_factory=Lock, init=False, repr=False
+    )
 
     def __post_init__(self):
         if not self.bus or isinstance(self.bus, FakeBus):
@@ -1397,7 +1403,6 @@ class OVOSAgentProtocol(AgentProtocol):
             reply_deadline = None
             answered = False
             handler_active = False
-            handler_started_at = None
             while True:
                 deadline = response_deadline
                 if handled_deadline is not None:
@@ -1425,15 +1430,10 @@ class OVOSAgentProtocol(AgentProtocol):
                     return
                 if event == "handler_start":
                     handler_active = True
-                    handler_started_at = chunk
                     handled_deadline = None
                     reply_deadline = None
                     continue
                 if event == "handler_done":
-                    if handler_started_at is not None:
-                        SKILL_HANDLER.observe_ms(
-                            max(0.0, chunk - handler_started_at) * 1000
-                        )
                     yield None
                     return
                 if event == "done":
@@ -1501,6 +1501,7 @@ class OVOSAgentProtocol(AgentProtocol):
         Client isolation happens here: clients only get responses to their own messages.
         """
         message = Message.deserialize(message)
+        self._observe_skill_lifecycle(message)
         if self._is_runtime_private_event(message.msg_type):
             return
         target_peers = message.context.get("destination") or []
@@ -1535,6 +1536,66 @@ class OVOSAgentProtocol(AgentProtocol):
                     f"{message.msg_type} - destination peer not connected: "
                     f"{peer}"
                 )
+
+    def _observe_skill_lifecycle(self, message: Message) -> None:
+        """Measure correlated OVOS handler execution without forwarding it.
+
+        The runtime catch-all sees lifecycle events for both HiveMind QUERY and
+        ordinary BUS utterance paths. Pairing by the OVOS query/session
+        identifiers moves the metric to that common boundary while the
+        existing private-event filter keeps lifecycle traffic off satellites.
+        State is time-bounded and size-bounded so missing completion events
+        cannot leak memory.
+        """
+        lifecycle = message.msg_type
+        if lifecycle not in {
+            "mycroft.skill.handler.start",
+            "mycroft.skill.handler.complete",
+            "mycroft.skill.handler.error",
+        }:
+            return
+        identifiers = self._message_query_ids(message)
+        if not identifiers:
+            return
+        # A few lightweight embedders instantiate this dataclass through
+        # ``__new__`` to avoid opening a runtime bus; keep that supported.
+        if not hasattr(self, "_skill_handler_starts"):
+            self._skill_handler_starts = {}
+        if not hasattr(self, "_skill_handler_starts_lock"):
+            self._skill_handler_starts_lock = Lock()
+
+        now = time.monotonic()
+        completed_starts = []
+        with self._skill_handler_starts_lock:
+            stale = [
+                identifier
+                for identifier, started in self._skill_handler_starts.items()
+                if now - started > 60.0
+            ]
+            for identifier in stale:
+                self._skill_handler_starts.pop(identifier, None)
+
+            if lifecycle == "mycroft.skill.handler.start":
+                while len(self._skill_handler_starts) + len(identifiers) > 4096:
+                    oldest = next(iter(self._skill_handler_starts), None)
+                    if oldest is None:
+                        break
+                    self._skill_handler_starts.pop(oldest, None)
+                for identifier in identifiers:
+                    self._skill_handler_starts[identifier] = now
+                return
+
+            for identifier in identifiers:
+                started = self._skill_handler_starts.pop(identifier, None)
+                if started is not None:
+                    completed_starts.append(started)
+
+        if completed_starts:
+            # query_id and session_id commonly carry the same lifecycle; emit
+            # one sample using the newest matching start, never one per alias.
+            SKILL_HANDLER.observe_ms(
+                max(0.0, now - max(completed_starts)) * 1000
+            )
 
     @staticmethod
     def _is_runtime_private_event(message_type: str) -> bool:

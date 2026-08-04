@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 from ovos_bus_client.message import Message
 from hivemind_bus_client.message import HiveMessageType
+from hivemind_ovos_agent_plugin._metrics import SKILL_HANDLER
 
 
 def _ovos_internal(msg_type, destination=None, data=None):
@@ -14,6 +15,22 @@ def _ovos_internal(msg_type, destination=None, data=None):
 
 
 class TestClientIsolation:
+    def test_private_handler_lifecycle_is_measured_once(self, agent):
+        initial = SKILL_HANDLER.snapshot()["count"]
+        context = {
+            "query_id": "query-1",
+            "session": {"session_id": "query-1"},
+        }
+
+        agent.handle_internal_mycroft(Message(
+            "mycroft.skill.handler.start", {}, context
+        ).serialize())
+        agent.handle_internal_mycroft(Message(
+            "mycroft.skill.handler.complete", {}, context
+        ).serialize())
+
+        assert SKILL_HANDLER.snapshot()["count"] == initial + 1
+
     @pytest.mark.parametrize("message_type", [
         "mycroft.skill.handler.start",
         "mycroft.skill.handler.complete",
