@@ -1,5 +1,7 @@
 """Client isolation invariant: a client must only receive messages targeted at it."""
 
+from unittest.mock import patch
+
 from ovos_bus_client.message import Message
 from hivemind_bus_client.message import HiveMessageType
 
@@ -50,6 +52,18 @@ class TestClientIsolation:
         agent.handle_internal_mycroft(_ovos_internal("speak", destination="ws://stranger"))
 
         alice.send.assert_not_called()
+
+    def test_unknown_destination_is_diagnosed(self, agent, make_client):
+        alice = make_client("ws://alice")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+
+        with patch("hivemind_ovos_agent_plugin.LOG.warning") as warning:
+            agent.handle_internal_mycroft(
+                _ovos_internal("speak", destination="ws://stranger")
+            )
+
+        warning.assert_called_once()
+        assert "ws://stranger" in warning.call_args.args[0]
 
     def test_message_addressed_to_stale_peer_is_dropped_without_raising(self, agent, make_client):
         alice = make_client("ws://alice")

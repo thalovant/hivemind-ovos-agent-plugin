@@ -718,6 +718,9 @@ class OVOSAgentProtocol(AgentProtocol):
     """HiveMind agent protocol that bridges client messages to an OVOS bus."""
     bus: MessageBusClient = dataclasses.field(default_factory=FakeBus)
     config: Dict[str, Any] = dataclasses.field(default_factory=lambda: Configuration().get("websocket", {}))
+    _owned_bus: Optional[MessageBusClient] = dataclasses.field(
+        default=None, init=False, repr=False, compare=False
+    )
     _active_query_scopes: Dict[str, Set[str]] = dataclasses.field(
         default_factory=dict, init=False, repr=False
     )
@@ -744,7 +747,7 @@ class OVOSAgentProtocol(AgentProtocol):
         if not self.bus or isinstance(self.bus, FakeBus):
             ovos_bus_address = self.config.get("host") or "127.0.0.1"
             ovos_bus_port = self.config.get("port") or 8181
-            timeout = self.config.get("connection_timeout", 10)
+            timeout = self._connection_timeout()
             self.bus = _RuntimeMessageBusClient(
                 host=ovos_bus_address,
                 port=ovos_bus_port,
@@ -767,19 +770,19 @@ class OVOSAgentProtocol(AgentProtocol):
             # that receive thread is dispatching a message.
             self._ensure_query_dispatchers(self.bus)
             self.bus.run_in_thread()
-            # Fail fast instead of blocking forever: a bare ``connected_event.wait()``
-            # hangs indefinitely when no OVOS messagebus is reachable, which silently
-            # stalls whatever hosts this protocol (e.g. HiveMindService.run() never
-            # binds its network listeners). Raise a clear, actionable error instead.
+            self._owned_bus = self.bus
+            # Bound startup without taking the whole HiveMind node down. The
+            # managed client keeps reconnecting in the background; get_bus()
+            # reports it unavailable immediately until that succeeds.
             if not self.bus.connected_event.wait(timeout):
-                self.bus.close()
-                raise ConnectionError(
+                LOG.error(
                     f"Could not connect to the OVOS messagebus at "
                     f"ws://{ovos_bus_address}:{ovos_bus_port} within {timeout}s. "
-                    f"Is the OVOS messagebus running? Start it (e.g. 'ovos-messagebus'), "
-                    f"or set the agent protocol's host/port/connection_timeout in the config."
+                    "Retrying in the background; clients will receive "
+                    "backend_unavailable until it connects."
                 )
         else:
+            self._owned_bus = None
             self._ensure_query_dispatchers(self.bus)
         self.register_bus_handlers()
 
@@ -787,6 +790,30 @@ class OVOSAgentProtocol(AgentProtocol):
         LOG.debug("registering internal OVOS bus handlers")
         self.bus.on("hive.send.downstream", self.handle_send)
         self.bus.on("message", self.handle_internal_mycroft)  # catch all
+
+    def _connection_timeout(self) -> float:
+        """Return a finite, non-negative startup wait."""
+        raw = self.config.get("connection_timeout", 10)
+        try:
+            timeout = float(raw)
+        except (TypeError, ValueError):
+            return 10.0
+        return timeout if math.isfinite(timeout) and timeout >= 0 else 10.0
+
+    def get_bus(self, client=None) -> FakeBus | MessageBusClient:
+        """Return a usable bus without blocking Core's shared IOLoop thread."""
+        bus = self.bus
+        if bus is not self._owned_bus or bus.connected_event.is_set():
+            return bus
+        raise ConnectionError("OVOS messagebus is not connected")
+
+    def wait_for_bus(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the owned runtime bus from setup or maintenance code."""
+        if self.bus is not self._owned_bus:
+            return True
+        if timeout is None:
+            timeout = self._connection_timeout()
+        return self.bus.connected_event.wait(timeout)
 
     def _send_to_client(self, peer: str, client, hmessage: HiveMessage) -> bool:
         """Send a HiveMessage without letting stale sockets break bus dispatch."""
@@ -1361,6 +1388,7 @@ class OVOSAgentProtocol(AgentProtocol):
             target_peers = [target_peers]
 
         if target_peers:
+            unmatched = set(target_peers)
             session = message.context.get("session")
             if isinstance(session, dict):
                 # OVOS-SESSION-1 §2.1 requires registered null fields to be
@@ -1372,6 +1400,7 @@ class OVOSAgentProtocol(AgentProtocol):
                 }
             for peer, client in list(self.clients.items()):
                 if peer in target_peers:
+                    unmatched.discard(peer)
                     LOG.debug(f"{message.msg_type} - destination: {peer}")
                     message.context["source"] = "hive"
                     msg = HiveMessage(
@@ -1381,6 +1410,11 @@ class OVOSAgentProtocol(AgentProtocol):
                         payload=message,
                     )
                     self._send_to_client(peer, client, msg)
+            for peer in unmatched:
+                LOG.warning(
+                    f"{message.msg_type} - destination peer not connected: "
+                    f"{peer}"
+                )
 
 
 # back-compat alias for the old class name shipped from ovos-bus-client
