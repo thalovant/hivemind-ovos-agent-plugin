@@ -16,7 +16,7 @@ def _closed_port() -> int:
     return port
 
 
-def test_starts_degraded_when_messagebus_unreachable():
+def test_starts_degraded_when_messagebus_unreachable(monkeypatch):
     port = _closed_port()
     start = time.monotonic()
     agent = OVOSAgentProtocol(config={"host": "127.0.0.1", "port": port,
@@ -28,6 +28,7 @@ def test_starts_degraded_when_messagebus_unreachable():
             agent.get_bus()
 
         agent.bus.connected_event.set()
+        monkeypatch.setattr(agent.bus, "_transport_is_open", lambda: True)
         assert agent.get_bus() is agent.bus
     finally:
         agent.bus.close()

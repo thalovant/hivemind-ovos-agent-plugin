@@ -1,8 +1,10 @@
 import dataclasses
 import logging
 import math
+import queue
 import time
 import uuid
+from concurrent.futures import Future
 from copy import deepcopy
 from threading import Event, Lock, Thread, current_thread
 from typing import Callable, Dict, Any, Iterator, Optional, Set
@@ -28,6 +30,11 @@ from hivemind_ovos_agent_plugin.policy import (AddBlacklistedIntent,
                                                 RewriteUtterance,
                                                 SetContextField,
                                                 SetSessionField)
+from hivemind_ovos_agent_plugin._metrics import (
+    BUS_WRITE,
+    BUS_WRITE_QUEUE,
+    SKILL_HANDLER,
+)
 from hivemind_ovos_agent_plugin.version import __version__
 
 
@@ -94,13 +101,19 @@ class _RuntimeMessageBusClient(MessageBusClient):
 
     def __init__(self, *args, reconnect_error_after=120,
                  message_send_timeout=15, ping_interval=15,
-                 ping_timeout=5, delivery_recovery_timeout=20, **kwargs):
+                 ping_timeout=5, delivery_recovery_timeout=20,
+                 bus_write_queue_size=256, **kwargs):
         """Initialize bounded reconnect state before creating the bus client."""
         _install_websocket_disconnect_log_filter()
         self._disconnect_started_at = None
         self._disconnect_escalated = False
         self._reconnect_state_lock = Lock()
         self._send_lock = Lock()
+        self._bus_write_queue = queue.Queue(
+            maxsize=self._positive_int(bus_write_queue_size, 256)
+        )
+        self._bus_writer_stop = Event()
+        self._bus_writer_thread = None
         self._query_receipt_events = {}
         self._query_receipt_lock = Lock()
         self._query_receipt_dispatchers = {}
@@ -128,6 +141,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
         # thread starts. Query workers must never mutate pyee registrations
         # while that thread is dispatching a runtime response.
         self._ensure_query_receipt_dispatchers()
+        self._start_bus_writer()
 
     @staticmethod
     def _positive_float(value, default):
@@ -137,6 +151,15 @@ class _RuntimeMessageBusClient(MessageBusClient):
         except (TypeError, ValueError):
             return default
         return parsed if math.isfinite(parsed) and parsed > 0 else default
+
+    @staticmethod
+    def _positive_int(value, default):
+        """Return a positive integer suitable for bounded queue settings."""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
 
     @staticmethod
     def _error_from_args(args):
@@ -166,7 +189,58 @@ class _RuntimeMessageBusClient(MessageBusClient):
         self._ensure_reconnect_state()
         with self._reconnect_state_lock:
             self._close_requested = True
-        return super().close()
+        writer_stop = getattr(self, "_bus_writer_stop", None)
+        if writer_stop is not None:
+            writer_stop.set()
+        result = super().close()
+        writer = getattr(self, "_bus_writer_thread", None)
+        if writer is not None and writer is not current_thread():
+            writer.join(timeout=1.0)
+        return result
+
+    def _start_bus_writer(self):
+        """Start the single ordered OVOS-bus writer exactly once."""
+        writer = self._bus_writer_thread
+        if writer is not None and writer.is_alive():
+            return
+        writer = Thread(
+            target=self._run_bus_writer,
+            name="ovos-runtime-bus-writer",
+            daemon=True,
+        )
+        self._bus_writer_thread = writer
+        writer.start()
+
+    def _run_bus_writer(self):
+        """Drain application frames in FIFO order outside caller threads."""
+        while (not self._bus_writer_stop.is_set()
+               or not self._bus_write_queue.empty()):
+            try:
+                enqueued_at, message, completion = self._bus_write_queue.get(
+                    timeout=0.1
+                )
+            except queue.Empty:
+                continue
+            BUS_WRITE_QUEUE.observe_ms(
+                (time.monotonic() - enqueued_at) * 1000
+            )
+            write_started = time.monotonic()
+            try:
+                self._send_synchronously(message, reconnect=False)
+            except Exception as error:
+                completion.set_exception(error)
+                LOG.warning(
+                    "OVOS bus writer rejected %s: %s",
+                    getattr(message, "msg_type", type(message).__name__),
+                    error,
+                )
+            else:
+                completion.set_result(None)
+            finally:
+                BUS_WRITE.observe_ms(
+                    (time.monotonic() - write_started) * 1000
+                )
+                self._bus_write_queue.task_done()
 
     def _ensure_reconnect_state(self):
         """Initialize reconnect state for normal and test-constructed clients."""
@@ -391,6 +465,26 @@ class _RuntimeMessageBusClient(MessageBusClient):
             raise errors[0]
 
     def _send(self, message):
+        """Queue one bus frame without blocking the HiveMind caller thread."""
+        # Retain direct behavior for legacy subclasses and test instances that
+        # bypass ``__init__``. Fully initialized production clients always own
+        # the bounded writer queue.
+        if not hasattr(self, "_bus_write_queue"):
+            return self._send_synchronously(message)
+        if not self.connected_event.is_set() or not self._transport_is_open():
+            error = ConnectionError("OVOS messagebus is not connected")
+            self._schedule_reconnect(error)
+            raise error
+        completion = Future()
+        try:
+            self._bus_write_queue.put_nowait(
+                (time.monotonic(), message, completion)
+            )
+        except queue.Full as error:
+            raise TimeoutError("OVOS messagebus write queue is full") from error
+        return completion
+
+    def _send_synchronously(self, message, *, reconnect=True):
         """Send once, reconnecting a stale runtime socket within a hard bound.
 
         ``ovos-bus-client`` waits without a timeout after its initial ten
@@ -410,12 +504,17 @@ class _RuntimeMessageBusClient(MessageBusClient):
         deadline = time.monotonic() + self._message_send_timeout
         last_error = None
 
-        for attempt in range(2):
-            if not self._wait_for_live_transport(deadline):
+        attempts = 2 if reconnect else 1
+        for attempt in range(attempts):
+            if reconnect and not self._wait_for_live_transport(deadline):
                 raise TimeoutError(
                     "OVOS message bus did not reconnect within "
                     f"{self._message_send_timeout:.1f} seconds"
                 ) from last_error
+            if (not reconnect
+                    and (not self.connected_event.is_set()
+                         or not self._transport_is_open())):
+                raise ConnectionError("OVOS messagebus is not connected")
             lock_acquired = False
             try:
                 # websocket-client does not make the message-level ordering
@@ -458,7 +557,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     raise
                 last_error = exc
                 self._schedule_reconnect(exc)
-                if attempt == 0:
+                if reconnect and attempt == 0:
                     continue
                 raise ConnectionError(
                     f"OVOS message bus closed while sending {message_type}"
@@ -761,6 +860,9 @@ class OVOSAgentProtocol(AgentProtocol):
                 delivery_recovery_timeout=self.config.get(
                     "delivery_recovery_timeout", 20
                 ),
+                bus_write_queue_size=self.config.get(
+                    "bus_write_queue_size", 256
+                ),
                 ping_interval=self.config.get("ping_interval", 15),
                 ping_timeout=self.config.get("ping_timeout", 5),
             )
@@ -807,7 +909,11 @@ class OVOSAgentProtocol(AgentProtocol):
     def get_bus(self, client=None) -> FakeBus | MessageBusClient:
         """Return a usable bus without blocking Core's shared IOLoop thread."""
         bus = self.bus
-        if bus is not self._owned_bus or bus.connected_event.is_set():
+        if bus is not self._owned_bus:
+            return bus
+        if (bus.connected_event.is_set()
+                and (not isinstance(bus, _RuntimeMessageBusClient)
+                     or bus._transport_is_open())):
             return bus
         raise ConnectionError("OVOS messagebus is not connected")
 
@@ -1216,11 +1322,11 @@ class OVOSAgentProtocol(AgentProtocol):
 
         def _on_handler_start(msg):
             if _matches_query(msg):
-                q.put(("handler_start", None))
+                q.put(("handler_start", time.monotonic()))
 
         def _on_handler_done(msg):
             if _matches_query(msg):
-                q.put(("handler_done", None))
+                q.put(("handler_done", time.monotonic()))
 
         def _on_done(msg):
             if _matches_query(msg):
@@ -1291,6 +1397,7 @@ class OVOSAgentProtocol(AgentProtocol):
             reply_deadline = None
             answered = False
             handler_active = False
+            handler_started_at = None
             while True:
                 deadline = response_deadline
                 if handled_deadline is not None:
@@ -1318,10 +1425,15 @@ class OVOSAgentProtocol(AgentProtocol):
                     return
                 if event == "handler_start":
                     handler_active = True
+                    handler_started_at = chunk
                     handled_deadline = None
                     reply_deadline = None
                     continue
                 if event == "handler_done":
+                    if handler_started_at is not None:
+                        SKILL_HANDLER.observe_ms(
+                            max(0.0, chunk - handler_started_at) * 1000
+                        )
                     yield None
                     return
                 if event == "done":
@@ -1389,6 +1501,8 @@ class OVOSAgentProtocol(AgentProtocol):
         Client isolation happens here: clients only get responses to their own messages.
         """
         message = Message.deserialize(message)
+        if self._is_runtime_private_event(message.msg_type):
+            return
         target_peers = message.context.get("destination") or []
         if not isinstance(target_peers, list):
             target_peers = [target_peers]
@@ -1421,6 +1535,23 @@ class OVOSAgentProtocol(AgentProtocol):
                     f"{message.msg_type} - destination peer not connected: "
                     f"{peer}"
                 )
+
+    @staticmethod
+    def _is_runtime_private_event(message_type: str) -> bool:
+        """Return whether an OVOS control event is private to the runtime.
+
+        Public client replies such as ``speak`` and
+        ``ovos.utterance.handled`` intentionally remain routable. The narrow
+        denylist only removes capability probes, fallback coordination,
+        handler lifecycle, and Thalovant delivery receipts.
+        """
+        if message_type.startswith("mycroft.skill.handler."):
+            return True
+        if message_type.startswith("thalovant.runtime."):
+            return True
+        if message_type.startswith("ovos.skills.fallback."):
+            return True
+        return message_type.endswith((".fallback.ping", ".fallback.pong"))
 
 
 # back-compat alias for the old class name shipped from ovos-bus-client

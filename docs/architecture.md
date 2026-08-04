@@ -80,9 +80,12 @@ hivemind-ovos-agent-plugin   <- depends on all of the above; nothing depends on 
 
 ## Threading
 
-The plugin runs the OVOS bus client on its own background thread (started in
-`__post_init__` via `MessageBusClient.run_in_thread()`). Both registered handlers
-(`handle_send`, `handle_internal_mycroft`) execute on that bus thread.
+The plugin runs the OVOS bus client on its own background thread. Application
+writes enter one bounded FIFO queue and a single writer drains that queue, so
+HiveMind workers never contend inside `websocket-client` or wait indefinitely
+behind a disconnected transport. A disconnected bus and a full queue both fail
+immediately. Registered receive handlers still execute on the bus thread.
 
-The plugin holds no mutable state of its own; the `self.clients` mapping is owned by
-the `HiveMindListenerProtocol` and is safe to read from any thread.
+The `self.clients` mapping is owned by `HiveMindListenerProtocol`; fan-out reads
+a stable item snapshot because connect and disconnect callbacks may mutate that
+mapping concurrently.
