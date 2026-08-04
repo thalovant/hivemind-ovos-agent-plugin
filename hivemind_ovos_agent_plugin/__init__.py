@@ -221,25 +221,35 @@ class _RuntimeMessageBusClient(MessageBusClient):
                 )
             except queue.Empty:
                 continue
-            BUS_WRITE_QUEUE.observe_ms(
-                (time.monotonic() - enqueued_at) * 1000
-            )
-            write_started = time.monotonic()
             try:
-                self._send_synchronously(message, reconnect=False)
-            except Exception as error:
-                completion.set_exception(error)
-                LOG.warning(
-                    "OVOS bus writer rejected %s: %s",
-                    getattr(message, "msg_type", type(message).__name__),
-                    error,
+                BUS_WRITE_QUEUE.observe_ms(
+                    (time.monotonic() - enqueued_at) * 1000
                 )
-            else:
-                completion.set_result(None)
+                # A canceled queued write belongs to an abandoned HiveMind
+                # request.  Claim the Future before touching the socket so a
+                # concurrent cancellation can never kill the only writer.
+                if not completion.set_running_or_notify_cancel():
+                    continue
+                write_started = time.monotonic()
+                try:
+                    self._send_synchronously(message, reconnect=False)
+                except Exception as error:  # noqa: BLE001
+                    # The Future is the asynchronous delivery contract.  Any
+                    # normal send failure must reach its caller without
+                    # terminating the single ordered writer.
+                    completion.set_exception(error)
+                    LOG.warning(
+                        "OVOS bus writer rejected %s: %s",
+                        getattr(message, "msg_type", type(message).__name__),
+                        error,
+                    )
+                else:
+                    completion.set_result(None)
+                finally:
+                    BUS_WRITE.observe_ms(
+                        (time.monotonic() - write_started) * 1000
+                    )
             finally:
-                BUS_WRITE.observe_ms(
-                    (time.monotonic() - write_started) * 1000
-                )
                 self._bus_write_queue.task_done()
 
     def _ensure_reconnect_state(self):
@@ -471,17 +481,31 @@ class _RuntimeMessageBusClient(MessageBusClient):
         # the bounded writer queue.
         if not hasattr(self, "_bus_write_queue"):
             return self._send_synchronously(message)
-        if not self.connected_event.is_set() or not self._transport_is_open():
+        self._ensure_reconnect_state()
+        reconnect = False
+        completion = Future()
+        with self._reconnect_state_lock:
+            # Serialize admission with close().  A frame accepted before close
+            # is drained by the writer; a frame arriving after shutdown begins
+            # is rejected instead of being left on a queue with no consumer.
+            if self._close_requested or self._bus_writer_stop.is_set():
+                raise ConnectionError("OVOS messagebus is closing")
+            if (not self.connected_event.is_set()
+                    or not self._transport_is_open()):
+                reconnect = True
+            else:
+                try:
+                    self._bus_write_queue.put_nowait(
+                        (time.monotonic(), message, completion)
+                    )
+                except queue.Full as error:
+                    raise TimeoutError(
+                        "OVOS messagebus write queue is full"
+                    ) from error
+        if reconnect:
             error = ConnectionError("OVOS messagebus is not connected")
             self._schedule_reconnect(error)
             raise error
-        completion = Future()
-        try:
-            self._bus_write_queue.put_nowait(
-                (time.monotonic(), message, completion)
-            )
-        except queue.Full as error:
-            raise TimeoutError("OVOS messagebus write queue is full") from error
         return completion
 
     def _send_synchronously(self, message, *, reconnect=True):

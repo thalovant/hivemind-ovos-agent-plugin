@@ -260,6 +260,40 @@ def test_production_bus_writer_fails_immediately_when_disconnected():
     client._schedule_reconnect.assert_called_once()
 
 
+def test_production_bus_writer_rejects_frames_after_shutdown_begins():
+    """Never enqueue work after the only writer has been asked to stop."""
+    client = _queued_client()
+    client._ensure_reconnect_state()
+    with client._reconnect_state_lock:
+        client._close_requested = True
+        client._bus_writer_stop.set()
+
+    with pytest.raises(ConnectionError, match="is closing"):
+        client._send(Message("too-late"))
+
+    assert client._bus_write_queue.empty()
+
+
+def test_canceled_queued_write_does_not_terminate_the_bus_writer():
+    """Skip abandoned work and keep the single ordered writer available."""
+    client = _queued_client()
+    client._send_synchronously = MagicMock()
+    canceled = client._send(Message("abandoned"))
+    assert canceled.cancel()
+
+    client._start_bus_writer()
+    delivered = client._send(Message("still-live"))
+
+    assert delivered.result(timeout=1) is None
+    client._bus_writer_stop.set()
+    client._bus_writer_thread.join(timeout=1)
+
+    assert not client._bus_writer_thread.is_alive()
+    client._send_synchronously.assert_called_once_with(
+        Message("still-live"), reconnect=False
+    )
+
+
 def test_send_recovers_a_stale_transport_without_leaking_worker(monkeypatch):
     """Wake the reconnect path and retry on the replacement websocket."""
     client = _client()
