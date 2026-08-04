@@ -1,11 +1,15 @@
 """Verify the plugin registers handlers and exposes a nonblocking bus."""
 
 import time
+from threading import Event
 from unittest.mock import MagicMock
 
 import pytest
 
-from hivemind_ovos_agent_plugin import OVOSAgentProtocol
+from hivemind_ovos_agent_plugin import (
+    OVOSAgentProtocol,
+    _RuntimeMessageBusClient,
+)
 
 
 class TestBusRegistration:
@@ -81,6 +85,18 @@ class TestBusRegistration:
 
         assert agent.wait_for_bus() is True
         bus.connected_event.wait.assert_called_once_with(3.0)
+
+    def test_wait_for_bus_rejects_stale_runtime_connected_event(self, agent):
+        bus = _RuntimeMessageBusClient.__new__(_RuntimeMessageBusClient)
+        bus.connected_event = Event()
+        bus.connected_event.set()
+        bus.client = MagicMock()
+        bus.client.sock.connected = False
+        bus._schedule_reconnect = MagicMock()
+        agent.bus = agent._owned_bus = bus
+
+        assert agent.wait_for_bus(0) is False
+        bus._schedule_reconnect.assert_called_once()
 
     @pytest.mark.parametrize("timeout", ["invalid", float("inf"), -1])
     def test_wait_for_bus_normalizes_invalid_explicit_timeout(self, agent,

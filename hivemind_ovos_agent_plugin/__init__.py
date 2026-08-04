@@ -948,13 +948,17 @@ class OVOSAgentProtocol(AgentProtocol):
         raise ConnectionError("OVOS messagebus is not connected")
 
     def wait_for_bus(self, timeout: Optional[float] = None) -> bool:
-        """Wait for the owned runtime bus from setup or maintenance code."""
+        """Wait for a usable owned runtime bus from maintenance code."""
         if self.bus is not self._owned_bus:
             return True
         if timeout is None:
             timeout = self._connection_timeout()
         else:
             timeout = self._normalize_timeout(timeout)
+        if isinstance(self.bus, _RuntimeMessageBusClient):
+            return self.bus._wait_for_live_transport(
+                time.monotonic() + timeout
+            )
         return self.bus.connected_event.wait(timeout)
 
     def _send_to_client(self, peer: str, client, hmessage: HiveMessage) -> bool:
