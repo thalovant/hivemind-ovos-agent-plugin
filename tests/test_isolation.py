@@ -115,15 +115,34 @@ class TestClientIsolation:
 
         with patch("hivemind_ovos_agent_plugin.LOG.warning") as warning:
             agent.handle_internal_mycroft(
-                _ovos_internal("speak", destination="ws://stranger")
+                _ovos_internal("speak", destination="voice_sat::deadbeef")
             )
 
         warning.assert_called_once()
         assert warning.call_args.args == (
             "%s - destination peer not connected: %s",
             "speak",
-            "ws://stranger",
+            "voice_sat::deadbeef",
         )
+
+    def test_ordinary_ovos_destinations_do_not_warn(self, agent, make_client):
+        alice = make_client("voice_sat::c0ffee")
+        agent.hm_protocol.clients = {"voice_sat::c0ffee": alice}
+
+        with patch("hivemind_ovos_agent_plugin.LOG.warning") as warning:
+            for destination in (
+                "audio",
+                "enclosure",
+                "skills",
+                "ovos.gui",
+                "ovos-skill-date-time.openvoiceos",
+            ):
+                agent.handle_internal_mycroft(
+                    _ovos_internal("speak", destination=destination)
+                )
+
+        warning.assert_not_called()
+        alice.send.assert_not_called()
 
     def test_message_addressed_to_stale_peer_is_dropped_without_raising(self, agent, make_client):
         alice = make_client("ws://alice")

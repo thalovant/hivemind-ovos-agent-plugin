@@ -53,6 +53,16 @@ __all__ = [
 ]
 
 
+def _is_peer_id(destination: str) -> bool:
+    """Return whether ``destination`` identifies a HiveMind connection.
+
+    HiveMind peers contain the ``name::session_id`` separator. OVOS also
+    routes ordinary component labels through ``context["destination"]``;
+    those labels must not be diagnosed as disconnected satellite peers.
+    """
+    return "::" in destination
+
+
 class _TransientWebsocketDisconnectFilter(logging.Filter):
     """Downgrade websocket-client's pre-callback rollout noise to INFO.
 
@@ -1805,11 +1815,18 @@ class OVOSAgentProtocol(AgentProtocol):
                 )
                 self._send_to_client(peer, client, msg)
             for peer in unmatched:
-                LOG.warning(
-                    "%s - destination peer not connected: %s",
-                    message.msg_type,
-                    peer,
-                )
+                if _is_peer_id(peer):
+                    LOG.warning(
+                        "%s - destination peer not connected: %s",
+                        message.msg_type,
+                        peer,
+                    )
+                else:
+                    LOG.debug(
+                        "%s - destination is not a peer: %s",
+                        message.msg_type,
+                        peer,
+                    )
 
     def _is_duplicate_public_reply(self, peer: str, message: Message) -> bool:
         """Suppress an exact repeated correlated reply for a short window.
