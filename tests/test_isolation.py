@@ -37,6 +37,11 @@ class TestClientIsolation:
         "ovos.skills.fallback.ping",
         "ovos.skills.fallback.skill-id.request",
         "thalovant.runtime.query.prepared",
+        "recognizer_loop:utterance",
+        "mycroft.intents.is_ready",
+        "mycroft.skills.is_ready.response",
+        "mycroft.thalovant-skill-weather.thalovant.is_ready",
+        "mycroft.ovos-skill-volume.openvoiceos.is_ready.response",
     ])
     def test_runtime_private_events_never_reach_clients(
             self, agent, make_client, message_type):
@@ -114,7 +119,11 @@ class TestClientIsolation:
             )
 
         warning.assert_called_once()
-        assert "ws://stranger" in warning.call_args.args[0]
+        assert warning.call_args.args == (
+            "%s - destination peer not connected: %s",
+            "speak",
+            "ws://stranger",
+        )
 
     def test_message_addressed_to_stale_peer_is_dropped_without_raising(self, agent, make_client):
         alice = make_client("ws://alice")

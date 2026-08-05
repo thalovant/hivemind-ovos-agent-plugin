@@ -1806,8 +1806,9 @@ class OVOSAgentProtocol(AgentProtocol):
                 self._send_to_client(peer, client, msg)
             for peer in unmatched:
                 LOG.warning(
-                    f"{message.msg_type} - destination peer not connected: "
-                    f"{peer}"
+                    "%s - destination peer not connected: %s",
+                    message.msg_type,
+                    peer,
                 )
 
     def _is_duplicate_public_reply(self, peer: str, message: Message) -> bool:
@@ -1942,6 +1943,11 @@ class OVOSAgentProtocol(AgentProtocol):
         if message_type.startswith("thalovant.runtime."):
             return True
         if message_type.startswith("ovos.skills.fallback."):
+            return True
+        if message_type == "recognizer_loop:utterance":
+            return True
+        if (message_type.startswith("mycroft.")
+                and message_type.endswith((".is_ready", ".is_ready.response"))):
             return True
         return message_type.endswith((".fallback.ping", ".fallback.pong"))
 
