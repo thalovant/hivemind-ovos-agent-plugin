@@ -6,7 +6,8 @@ from threading import Event, Lock, Thread
 from unittest.mock import MagicMock, call
 
 import pytest
-from websocket import WebSocketConnectionClosedException
+from websocket import (WebSocketAddressException,
+                       WebSocketConnectionClosedException)
 
 import hivemind_ovos_agent_plugin as agent_module
 from hivemind_ovos_agent_plugin import (
@@ -99,6 +100,23 @@ def test_closed_connection_uses_the_same_bounded_reconnect_path(monkeypatch):
     monkeypatch.setattr(agent_module.time, "monotonic", MagicMock(return_value=10))
 
     client.on_error(WebSocketConnectionClosedException("closed"))
+    _wait_for_reconnect(client)
+
+    logger.info.assert_called_once()
+    logger.warning.assert_not_called()
+    logger.exception.assert_not_called()
+    logger.error.assert_not_called()
+
+
+def test_runtime_dns_miss_uses_the_bounded_reconnect_path(monkeypatch):
+    """Treat a temporarily absent Kubernetes Service name as transient."""
+    client = _client()
+    logger = MagicMock()
+    monkeypatch.setattr(agent_module, "LOG", logger)
+    monkeypatch.setattr(agent_module.time, "sleep", MagicMock())
+    monkeypatch.setattr(agent_module.time, "monotonic", MagicMock(return_value=10))
+
+    client.on_error(WebSocketAddressException("runtime service not ready"))
     _wait_for_reconnect(client)
 
     logger.info.assert_called_once()

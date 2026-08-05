@@ -21,7 +21,8 @@ from ovos_utils import json_dumps
 from ovos_utils.fakebus import FakeBus
 from ovos_utils.log import LOG
 from pyee import EventEmitter
-from websocket import (WebSocketConnectionClosedException, WebSocketException,
+from websocket import (WebSocketAddressException,
+                       WebSocketConnectionClosedException, WebSocketException,
                        WebSocketTimeoutException)
 
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
@@ -186,6 +187,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
             ConnectionError,
             PermissionError,
             TimeoutError,
+            WebSocketAddressException,
             WebSocketConnectionClosedException,
             WebSocketTimeoutException,
         ))
