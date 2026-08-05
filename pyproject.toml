@@ -52,6 +52,9 @@ Issues = "https://github.com/JarbasHiveMind/hivemind-ovos-agent-plugin/issues"
 [project.entry-points."hivemind.policy"]
 "hivemind-ovos-agent-policy" = "hivemind_ovos_agent_plugin.policy:OVOSAgentPolicy"
 
+[project.entry-points."hivemind.performance.metrics"]
+ovos-agent = "hivemind_ovos_agent_plugin._metrics:performance_histograms"
+
 [tool.setuptools.dynamic]
 version = { attr = "hivemind_ovos_agent_plugin.version.__version__" }
 
