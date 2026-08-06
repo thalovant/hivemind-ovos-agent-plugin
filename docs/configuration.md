@@ -69,6 +69,11 @@ identity and rendezvous hashing. An unavailable selected shard produces
 `pool_size > 1` configuration is rejected because it cannot prove that separate
 connections terminate on separate broadcast buses.
 
+All listener replicas should receive the same shard list. If listeners intentionally own
+different shard subsets, ingress must consistently route an authenticated peer back to
+the listener that owns its shard; ordinary round-robin reconnects do not provide this
+guarantee. See [Listener ownership and ingress](architecture.md#listener-ownership-and-ingress).
+
 ## Reusing an existing bus connection
 
 If you instantiate `OVOSAgentProtocol` programmatically and pass a non-default `bus`

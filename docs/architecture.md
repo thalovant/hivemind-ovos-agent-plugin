@@ -112,6 +112,27 @@ This mode distributes independent skill requests. It does not turn one HiveMind 
 into a shared active-active relay: client registries, HiveMapper routes, and query/cascade
 collectors remain process-local as documented by HiveMind Core.
 
+### Listener ownership and ingress
+
+One established WebSocket is owned by one listener process for its lifetime. Horizontal
+listener replicas are safe only when the deployment also satisfies one of these routing
+models:
+
+- every listener has the same `runtime_shards` set, so the peer identity selects the same
+  runtime after reconnecting through a different listener; or
+- ingress consistently routes that peer to a listener which owns the selected runtime.
+
+A random or round-robin reconnect across listeners with different shard subsets is not
+sticky ownership and can move the peer to a different runtime. The plugin cannot repair
+that at the application layer because ingress chooses a listener before the authenticated
+HiveMind peer is available. Do not increase the partition count until the deployment has
+defined and tested reconnect-stable ownership.
+
+The originating listener remains the authoritative public reply route: it accepts a
+runtime reply only from the bus selected for the destination peer, then looks up the live
+peer in its process-local client registry. The short-lived deduplication guard is a safety
+net for broker retries or endpoint mistakes, not a replacement for bus ownership.
+
 The `self.clients` mapping is owned by `HiveMindListenerProtocol`; fan-out reads
 a stable item snapshot because connect and disconnect callbacks may mutate that
 mapping concurrently.
