@@ -16,9 +16,12 @@ from hivemind_ovos_agent_plugin._metrics import (
 )
 
 
-def _ovos_internal(msg_type, destination=None, data=None):
+def _ovos_internal(msg_type, destination=None, data=None, context=None):
     """Build the serialized JSON that handle_internal_mycroft expects."""
-    msg = Message(msg_type, data or {}, {"destination": destination} if destination is not None else {})
+    context = dict(context or {})
+    if destination is not None:
+        context["destination"] = destination
+    msg = Message(msg_type, data or {}, context)
     return msg.serialize()
 
 
@@ -29,6 +32,7 @@ class TestClientIsolation:
         ("mycroft.skill.handler.start", RUNTIME_BUS_SKILL_LIFECYCLE),
         ("ovos.intent.matched", RUNTIME_BUS_INTENT_LIFECYCLE),
         ("ovos.intent.handler.start", RUNTIME_BUS_INTENT_LIFECYCLE),
+        ("skill-id.activate", RUNTIME_BUS_INTENT_LIFECYCLE),
         ("recognizer_loop:audio_output_start", RUNTIME_BUS_AUDIO_LIFECYCLE),
         ("recognizer_loop:utterance_start", RUNTIME_BUS_AUDIO_LIFECYCLE),
         ("ovos.skills.fallback.ping", RUNTIME_BUS_FALLBACK_COORDINATION),
@@ -66,6 +70,7 @@ class TestClientIsolation:
         "ovos.intent.matched",
         "ovos.intent.handler.start",
         "ovos.intent.handler.complete",
+        "skill-id.activate",
         "ovos.skills.fallback.ping",
         "ovos.skills.fallback.skill-id.request",
         "thalovant.runtime.query.prepared",
@@ -88,6 +93,33 @@ class TestClientIsolation:
         )
 
         alice.send.assert_not_called()
+
+    def test_runtime_intent_dispatch_never_reaches_client(
+            self, agent, make_client):
+        alice = make_client("ws://alice")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+        initial = RUNTIME_BUS_INTENT_LIFECYCLE.snapshot()["count"]
+
+        agent.handle_internal_mycroft(_ovos_internal(
+            "skill-id:current.weather",
+            destination="ws://alice",
+            context={"skill_id": "skill-id", "pipeline_id": "padatious"},
+        ))
+
+        alice.send.assert_not_called()
+        assert RUNTIME_BUS_INTENT_LIFECYCLE.snapshot()["count"] == initial + 1
+
+    def test_skill_custom_reply_remains_routable(self, agent, make_client):
+        alice = make_client("ws://alice")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+
+        agent.handle_internal_mycroft(_ovos_internal(
+            "skill-id.custom.response",
+            destination="ws://alice",
+            context={"skill_id": "skill-id", "pipeline_id": "padatious"},
+        ))
+
+        alice.send.assert_called_once()
 
     @pytest.mark.parametrize("message_type", [
         "speak",

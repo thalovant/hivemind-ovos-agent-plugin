@@ -110,6 +110,11 @@ it is not replayed on another runtime because the first runtime may already have
 it. Runtime replies are accepted only by the bus that owns their destination peer, and a
 bounded short-lived guard suppresses exact repeated correlated replies.
 
+The runtime bridge consumes the OVOS activation and intent-dispatch inputs locally even
+though their derived message context still names the originating peer. These are inputs
+to the selected skill, not public replies. Public `speak`, `ovos.utterance.speak`,
+`ovos.utterance.handled`, and skill-defined custom response topics remain routable.
+
 This mode distributes independent skill requests. It does not turn one HiveMind server
 into a shared active-active relay: client registries, HiveMapper routes, and query/cascade
 collectors remain process-local as documented by HiveMind Core.

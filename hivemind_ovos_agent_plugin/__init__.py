@@ -1781,7 +1781,7 @@ class OVOSAgentProtocol(AgentProtocol):
         try:
             if isinstance(message, str):
                 message = Message.deserialize(message)
-            histogram = self._runtime_bus_event_histogram(message.msg_type)
+            histogram = self._runtime_bus_event_histogram(message)
             self._handle_runtime_bus_message(message, bus)
         finally:
             histogram.observe_ms((time.monotonic() - started) * 1000)
@@ -1789,7 +1789,7 @@ class OVOSAgentProtocol(AgentProtocol):
     def _handle_runtime_bus_message(self, message: Message, bus=None) -> None:
         """Apply lifecycle accounting and route one decoded runtime event."""
         self._observe_skill_lifecycle(message)
-        if self._is_runtime_private_event(message.msg_type):
+        if self._is_runtime_private_message(message):
             return
         target_peers = message.context.get("destination") or []
         if not isinstance(target_peers, list):
@@ -1848,14 +1848,15 @@ class OVOSAgentProtocol(AgentProtocol):
                     peer,
                 )
 
-    @staticmethod
-    def _runtime_bus_event_histogram(message_type: str):
+    @classmethod
+    def _runtime_bus_event_histogram(cls, message: Message):
         """Select one fixed-cardinality runtime event metric.
 
         The categories deliberately describe protocol roles instead of skill
         or message names so a scrape cannot grow with installed plugins or
         user traffic.
         """
+        message_type = message.msg_type
         if message_type in {
             "speak",
             "ovos.utterance.speak",
@@ -1865,7 +1866,8 @@ class OVOSAgentProtocol(AgentProtocol):
         if message_type.startswith("mycroft.skill.handler."):
             return RUNTIME_BUS_SKILL_LIFECYCLE
         if (message_type == "ovos.intent.matched"
-                or message_type.startswith("ovos.intent.handler.")):
+                or message_type.startswith("ovos.intent.handler.")
+                or cls._is_runtime_intent_dispatch(message)):
             return RUNTIME_BUS_INTENT_LIFECYCLE
         if message_type in {
             "recognizer_loop:audio_output_start",
@@ -1877,9 +1879,35 @@ class OVOSAgentProtocol(AgentProtocol):
                 or message_type.endswith((".fallback.ping", ".fallback.pong"))):
             return RUNTIME_BUS_FALLBACK_COORDINATION
         if (message_type.startswith("thalovant.runtime.")
-                or message_type == "recognizer_loop:utterance"):
+                or message_type in {
+                    "connected",
+                    "gui.status.request",
+                    "hive.client.connect",
+                    "ovos.session.sync",
+                    "recognizer_loop:utterance",
+                }):
             return RUNTIME_BUS_CONTROL
         return RUNTIME_BUS_OTHER
+
+    @staticmethod
+    def _is_runtime_intent_dispatch(message: Message) -> bool:
+        """Return whether an event invokes or activates a runtime skill.
+
+        OVOS dispatches an intent on ``<skill_id>:<intent_name>`` and emits
+        ``<skill_id>.activate`` immediately before it. Both messages retain
+        the requesting satellite as their destination because they derive
+        from the admitted utterance envelope, but they are runtime-internal
+        inputs to the skill rather than replies to the satellite.
+        """
+        message_type = message.msg_type
+        if message_type.endswith(".activate"):
+            return True
+        skill_id = message.context.get("skill_id")
+        return bool(
+            isinstance(skill_id, str)
+            and skill_id
+            and message_type.startswith(f"{skill_id}:")
+        )
 
     def _is_duplicate_public_reply(self, peer: str, message: Message) -> bool:
         """Suppress an exact repeated correlated reply for a short window.
@@ -2029,6 +2057,14 @@ class OVOSAgentProtocol(AgentProtocol):
                 and message_type.endswith((".is_ready", ".is_ready.response"))):
             return True
         return message_type.endswith((".fallback.ping", ".fallback.pong"))
+
+    @classmethod
+    def _is_runtime_private_message(cls, message: Message) -> bool:
+        """Return whether a decoded runtime message is not a client reply."""
+        return (
+            cls._is_runtime_private_event(message.msg_type)
+            or cls._is_runtime_intent_dispatch(message)
+        )
 
 
 # back-compat alias for the old class name shipped from ovos-bus-client

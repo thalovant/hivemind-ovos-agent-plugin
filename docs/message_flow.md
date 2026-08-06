@@ -53,9 +53,12 @@ plugin enforces; it is exercised by tests in `tests/test_isolation.py`.
 
 OVOS runtime coordination is not a downstream application response. The bridge consumes
 skill/intent handler lifecycle, fallback coordination, runtime receipt/probe, readiness,
-and recognizer audio lifecycle events locally instead of encrypting and forwarding those
-internal broadcasts to every satellite. Their fixed-cardinality metric categories remain
-scrapeable, so dropping them at the public boundary does not hide runtime work.
+recognizer audio lifecycle events, and the skill activation/intent-dispatch inputs locally
+instead of encrypting and forwarding those internal messages to satellites. Their
+fixed-cardinality metric categories remain scrapeable, so dropping them at the public
+boundary does not hide runtime work. Skill-defined custom response topics remain routable;
+only the reserved `<skill_id>.activate` and `<skill_id>:<intent_name>` dispatch shapes are
+consumed at this boundary.
 
 ## Downstream B: explicit `hive.send.downstream`
 
