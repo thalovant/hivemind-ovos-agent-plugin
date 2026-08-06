@@ -5,7 +5,14 @@ from unittest.mock import patch
 import pytest
 from ovos_bus_client.message import Message
 from hivemind_bus_client.message import HiveMessageType
-from hivemind_ovos_agent_plugin._metrics import SKILL_HANDLER
+from hivemind_ovos_agent_plugin._metrics import (
+    RUNTIME_BUS_CONTROL,
+    RUNTIME_BUS_FALLBACK_COORDINATION,
+    RUNTIME_BUS_OTHER,
+    RUNTIME_BUS_PUBLIC_REPLY,
+    RUNTIME_BUS_SKILL_LIFECYCLE,
+    SKILL_HANDLER,
+)
 
 
 def _ovos_internal(msg_type, destination=None, data=None):
@@ -15,6 +22,23 @@ def _ovos_internal(msg_type, destination=None, data=None):
 
 
 class TestClientIsolation:
+    @pytest.mark.parametrize(("message_type", "histogram"), [
+        ("speak", RUNTIME_BUS_PUBLIC_REPLY),
+        ("ovos.utterance.handled", RUNTIME_BUS_PUBLIC_REPLY),
+        ("mycroft.skill.handler.start", RUNTIME_BUS_SKILL_LIFECYCLE),
+        ("ovos.skills.fallback.ping", RUNTIME_BUS_FALLBACK_COORDINATION),
+        ("thalovant.runtime.query.prepared", RUNTIME_BUS_CONTROL),
+        ("recognizer_loop:utterance", RUNTIME_BUS_CONTROL),
+        ("recognizer_loop:audio_output_end", RUNTIME_BUS_OTHER),
+    ])
+    def test_runtime_bus_events_use_fixed_metric_categories(
+            self, agent, message_type, histogram):
+        initial = histogram.snapshot()["count"]
+
+        agent.handle_internal_mycroft(_ovos_internal(message_type))
+
+        assert histogram.snapshot()["count"] == initial + 1
+
     def test_private_handler_lifecycle_is_measured_once(self, agent):
         initial = SKILL_HANDLER.snapshot()["count"]
         context = {

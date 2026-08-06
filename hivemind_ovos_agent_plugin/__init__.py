@@ -37,6 +37,11 @@ from hivemind_ovos_agent_plugin.policy import (AddBlacklistedIntent,
 from hivemind_ovos_agent_plugin._metrics import (
     BUS_WRITE,
     BUS_WRITE_QUEUE,
+    RUNTIME_BUS_CONTROL,
+    RUNTIME_BUS_FALLBACK_COORDINATION,
+    RUNTIME_BUS_OTHER,
+    RUNTIME_BUS_PUBLIC_REPLY,
+    RUNTIME_BUS_SKILL_LIFECYCLE,
     SKILL_HANDLER,
 )
 from hivemind_ovos_agent_plugin.version import __version__
@@ -1769,66 +1774,101 @@ class OVOSAgentProtocol(AgentProtocol):
 
         Client isolation happens here: clients only get responses to their own messages.
         """
-        if isinstance(message, str):
-            message = Message.deserialize(message)
+        started = time.monotonic()
+        histogram = RUNTIME_BUS_OTHER
+        try:
+            if isinstance(message, str):
+                message = Message.deserialize(message)
+            histogram = self._runtime_bus_event_histogram(message.msg_type)
+            self._handle_runtime_bus_message(message, bus)
+        finally:
+            histogram.observe_ms((time.monotonic() - started) * 1000)
+
+    def _handle_runtime_bus_message(self, message: Message, bus=None) -> None:
+        """Apply lifecycle accounting and route one decoded runtime event."""
         self._observe_skill_lifecycle(message)
         if self._is_runtime_private_event(message.msg_type):
             return
         target_peers = message.context.get("destination") or []
         if not isinstance(target_peers, list):
             target_peers = [target_peers]
+        if not target_peers:
+            return
 
-        if target_peers:
-            session = message.context.get("session")
-            if isinstance(session, dict):
-                # OVOS-SESSION-1 §2.1 requires registered null fields to be
-                # omitted. Preserve unknown extension fields verbatim (§2.4).
-                message.context["session"] = {
-                    key: value
-                    for key, value in session.items()
-                    if value is not None or key not in SESSION1_REGISTERED_FIELDS
-                }
-            owned_targets = []
-            for peer in target_peers:
-                if (isinstance(peer, str) and peer
-                        and peer not in owned_targets
-                        and self._peer_owns_bus(peer, bus)):
-                    owned_targets.append(peer)
-            unmatched = set(owned_targets)
-            for peer in owned_targets:
-                client = self.clients.get(peer)
-                if client is None:
-                    continue
-                unmatched.discard(peer)
-                if self._is_duplicate_public_reply(peer, message):
-                    LOG.warning(
-                        "Dropped duplicate OVOS reply %s for %s",
-                        message.msg_type,
-                        peer,
-                    )
-                    continue
-                LOG.debug("%s - destination: %s", message.msg_type, peer)
-                message.context["source"] = "hive"
-                msg = HiveMessage(
-                    HiveMessageType.BUS,
-                    source_peer=peer,
-                    target_peers=target_peers,
-                    payload=message,
+        session = message.context.get("session")
+        if isinstance(session, dict):
+            # OVOS-SESSION-1 §2.1 requires registered null fields to be
+            # omitted. Preserve unknown extension fields verbatim (§2.4).
+            message.context["session"] = {
+                key: value
+                for key, value in session.items()
+                if value is not None or key not in SESSION1_REGISTERED_FIELDS
+            }
+        owned_targets = []
+        for peer in target_peers:
+            if (isinstance(peer, str) and peer
+                    and peer not in owned_targets
+                    and self._peer_owns_bus(peer, bus)):
+                owned_targets.append(peer)
+        unmatched = set(owned_targets)
+        for peer in owned_targets:
+            client = self.clients.get(peer)
+            if client is None:
+                continue
+            unmatched.discard(peer)
+            if self._is_duplicate_public_reply(peer, message):
+                LOG.warning(
+                    "Dropped duplicate OVOS reply %s for %s",
+                    message.msg_type,
+                    peer,
                 )
-                self._send_to_client(peer, client, msg)
-            for peer in unmatched:
-                if _is_peer_id(peer):
-                    LOG.warning(
-                        "%s - destination peer not connected: %s",
-                        message.msg_type,
-                        peer,
-                    )
-                else:
-                    LOG.debug(
-                        "%s - destination is not a peer: %s",
-                        message.msg_type,
-                        peer,
-                    )
+                continue
+            LOG.debug("%s - destination: %s", message.msg_type, peer)
+            message.context["source"] = "hive"
+            msg = HiveMessage(
+                HiveMessageType.BUS,
+                source_peer=peer,
+                target_peers=target_peers,
+                payload=message,
+            )
+            self._send_to_client(peer, client, msg)
+        for peer in unmatched:
+            if _is_peer_id(peer):
+                LOG.warning(
+                    "%s - destination peer not connected: %s",
+                    message.msg_type,
+                    peer,
+                )
+            else:
+                LOG.debug(
+                    "%s - destination is not a peer: %s",
+                    message.msg_type,
+                    peer,
+                )
+
+    @staticmethod
+    def _runtime_bus_event_histogram(message_type: str):
+        """Select one fixed-cardinality runtime event metric.
+
+        The categories deliberately describe protocol roles instead of skill
+        or message names so a scrape cannot grow with installed plugins or
+        user traffic.
+        """
+        if message_type in {
+            "speak",
+            "ovos.utterance.speak",
+            "ovos.utterance.handled",
+        }:
+            return RUNTIME_BUS_PUBLIC_REPLY
+        if message_type.startswith("mycroft.skill.handler."):
+            return RUNTIME_BUS_SKILL_LIFECYCLE
+        if (message_type.startswith("ovos.skills.fallback.")
+                or message_type.endswith((".fallback.ping", ".fallback.pong"))):
+            return RUNTIME_BUS_FALLBACK_COORDINATION
+        if (message_type.startswith("thalovant.runtime.")
+                or message_type == "recognizer_loop:utterance"):
+            return RUNTIME_BUS_CONTROL
+        return RUNTIME_BUS_OTHER
 
     def _is_duplicate_public_reply(self, peer: str, message: Message) -> bool:
         """Suppress an exact repeated correlated reply for a short window.
