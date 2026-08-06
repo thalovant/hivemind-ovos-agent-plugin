@@ -73,6 +73,12 @@ RUNTIME_BUS_PUBLIC_REPLY = LatencyHistogram(
 RUNTIME_BUS_SKILL_LIFECYCLE = LatencyHistogram(
     "hivemind_runtime_bus_skill_lifecycle_ms"
 )
+RUNTIME_BUS_INTENT_LIFECYCLE = LatencyHistogram(
+    "hivemind_runtime_bus_intent_lifecycle_ms"
+)
+RUNTIME_BUS_AUDIO_LIFECYCLE = LatencyHistogram(
+    "hivemind_runtime_bus_audio_lifecycle_ms"
+)
 RUNTIME_BUS_FALLBACK_COORDINATION = LatencyHistogram(
     "hivemind_runtime_bus_fallback_coordination_ms"
 )
@@ -92,6 +98,8 @@ def performance_histograms() -> dict[str, dict[str, object]]:
             SKILL_HANDLER,
             RUNTIME_BUS_PUBLIC_REPLY,
             RUNTIME_BUS_SKILL_LIFECYCLE,
+            RUNTIME_BUS_INTENT_LIFECYCLE,
+            RUNTIME_BUS_AUDIO_LIFECYCLE,
             RUNTIME_BUS_FALLBACK_COORDINATION,
             RUNTIME_BUS_CONTROL,
             RUNTIME_BUS_OTHER,

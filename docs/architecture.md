@@ -32,9 +32,11 @@ It owns exactly three responsibilities:
 1. **Downstream dispatch**: when an OVOS component emits `hive.send.downstream` on the
    OVOS bus, forward the payload to the correct HiveMind client (or fan out for
    `PROPAGATE`/`BROADCAST` types).
-2. **Response routing with client isolation**: when any internal OVOS bus message has
-   `context["destination"]` set to a connected HiveMind peer, wrap it as a
-   `HiveMessageType.BUS` message and forward to that peer — and **only** that peer.
+2. **Response routing with client isolation**: when a public or application-defined
+   OVOS bus message has `context["destination"]` set to a connected HiveMind peer, wrap
+   it as a `HiveMessageType.BUS` message and forward to that peer — and **only** that
+   peer. Runtime-only fallback, handler, intent, readiness, receipt, and recognizer audio
+   lifecycle events terminate at this bridge.
 3. **Runtime selection**: when explicitly configured with independent runtime shards,
    return the one rendezvous-hashed bus for a client through the documented
    `AgentProtocol.get_bus(client)` contract, and use the same selection for the

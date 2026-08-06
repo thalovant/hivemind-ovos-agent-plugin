@@ -37,8 +37,10 @@ from hivemind_ovos_agent_plugin.policy import (AddBlacklistedIntent,
 from hivemind_ovos_agent_plugin._metrics import (
     BUS_WRITE,
     BUS_WRITE_QUEUE,
+    RUNTIME_BUS_AUDIO_LIFECYCLE,
     RUNTIME_BUS_CONTROL,
     RUNTIME_BUS_FALLBACK_COORDINATION,
+    RUNTIME_BUS_INTENT_LIFECYCLE,
     RUNTIME_BUS_OTHER,
     RUNTIME_BUS_PUBLIC_REPLY,
     RUNTIME_BUS_SKILL_LIFECYCLE,
@@ -1862,6 +1864,15 @@ class OVOSAgentProtocol(AgentProtocol):
             return RUNTIME_BUS_PUBLIC_REPLY
         if message_type.startswith("mycroft.skill.handler."):
             return RUNTIME_BUS_SKILL_LIFECYCLE
+        if (message_type == "ovos.intent.matched"
+                or message_type.startswith("ovos.intent.handler.")):
+            return RUNTIME_BUS_INTENT_LIFECYCLE
+        if message_type in {
+            "recognizer_loop:audio_output_start",
+            "recognizer_loop:audio_output_end",
+            "recognizer_loop:utterance_start",
+        }:
+            return RUNTIME_BUS_AUDIO_LIFECYCLE
         if (message_type.startswith("ovos.skills.fallback.")
                 or message_type.endswith((".fallback.ping", ".fallback.pong"))):
             return RUNTIME_BUS_FALLBACK_COORDINATION
@@ -1998,6 +2009,15 @@ class OVOSAgentProtocol(AgentProtocol):
         handler lifecycle, and Thalovant delivery receipts.
         """
         if message_type.startswith("mycroft.skill.handler."):
+            return True
+        if (message_type == "ovos.intent.matched"
+                or message_type.startswith("ovos.intent.handler.")):
+            return True
+        if message_type in {
+            "recognizer_loop:audio_output_start",
+            "recognizer_loop:audio_output_end",
+            "recognizer_loop:utterance_start",
+        }:
             return True
         if message_type.startswith("thalovant.runtime."):
             return True

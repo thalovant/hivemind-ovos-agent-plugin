@@ -20,7 +20,9 @@ client                hivemind-core                 OVOS bus
 ## Downstream A: skill replies / TTS / etc.
 
 OVOS skills typically emit responses with `context["destination"]` set to the original
-client peer. The plugin's catch-all `message` handler picks these up.
+client peer. The plugin's catch-all `message` handler picks these up. Public replies
+(`speak`, `ovos.utterance.speak`, and `ovos.utterance.handled`) and other explicitly
+targeted application messages remain routable.
 
 ```
 OVOS skill                  OVOSAgentProtocol             hivemind-core            client
@@ -48,6 +50,12 @@ A message with no `destination` is dropped. A message whose `destination` does n
 match any connected client is dropped. **A connected client never sees a message
 addressed to a different client.** This is the single security-critical invariant this
 plugin enforces; it is exercised by tests in `tests/test_isolation.py`.
+
+OVOS runtime coordination is not a downstream application response. The bridge consumes
+skill/intent handler lifecycle, fallback coordination, runtime receipt/probe, readiness,
+and recognizer audio lifecycle events locally instead of encrypting and forwarding those
+internal broadcasts to every satellite. Their fixed-cardinality metric categories remain
+scrapeable, so dropping them at the public boundary does not hide runtime work.
 
 ## Downstream B: explicit `hive.send.downstream`
 

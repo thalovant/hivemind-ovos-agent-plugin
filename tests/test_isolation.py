@@ -6,9 +6,10 @@ import pytest
 from ovos_bus_client.message import Message
 from hivemind_bus_client.message import HiveMessageType
 from hivemind_ovos_agent_plugin._metrics import (
+    RUNTIME_BUS_AUDIO_LIFECYCLE,
     RUNTIME_BUS_CONTROL,
     RUNTIME_BUS_FALLBACK_COORDINATION,
-    RUNTIME_BUS_OTHER,
+    RUNTIME_BUS_INTENT_LIFECYCLE,
     RUNTIME_BUS_PUBLIC_REPLY,
     RUNTIME_BUS_SKILL_LIFECYCLE,
     SKILL_HANDLER,
@@ -26,10 +27,14 @@ class TestClientIsolation:
         ("speak", RUNTIME_BUS_PUBLIC_REPLY),
         ("ovos.utterance.handled", RUNTIME_BUS_PUBLIC_REPLY),
         ("mycroft.skill.handler.start", RUNTIME_BUS_SKILL_LIFECYCLE),
+        ("ovos.intent.matched", RUNTIME_BUS_INTENT_LIFECYCLE),
+        ("ovos.intent.handler.start", RUNTIME_BUS_INTENT_LIFECYCLE),
+        ("recognizer_loop:audio_output_start", RUNTIME_BUS_AUDIO_LIFECYCLE),
+        ("recognizer_loop:utterance_start", RUNTIME_BUS_AUDIO_LIFECYCLE),
         ("ovos.skills.fallback.ping", RUNTIME_BUS_FALLBACK_COORDINATION),
         ("thalovant.runtime.query.prepared", RUNTIME_BUS_CONTROL),
         ("recognizer_loop:utterance", RUNTIME_BUS_CONTROL),
-        ("recognizer_loop:audio_output_end", RUNTIME_BUS_OTHER),
+        ("recognizer_loop:audio_output_end", RUNTIME_BUS_AUDIO_LIFECYCLE),
     ])
     def test_runtime_bus_events_use_fixed_metric_categories(
             self, agent, message_type, histogram):
@@ -58,10 +63,16 @@ class TestClientIsolation:
     @pytest.mark.parametrize("message_type", [
         "mycroft.skill.handler.start",
         "mycroft.skill.handler.complete",
+        "ovos.intent.matched",
+        "ovos.intent.handler.start",
+        "ovos.intent.handler.complete",
         "ovos.skills.fallback.ping",
         "ovos.skills.fallback.skill-id.request",
         "thalovant.runtime.query.prepared",
         "recognizer_loop:utterance",
+        "recognizer_loop:audio_output_start",
+        "recognizer_loop:audio_output_end",
+        "recognizer_loop:utterance_start",
         "mycroft.intents.is_ready",
         "mycroft.skills.is_ready.response",
         "mycroft.thalovant-skill-weather.thalovant.is_ready",
