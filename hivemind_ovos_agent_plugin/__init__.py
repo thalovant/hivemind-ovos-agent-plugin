@@ -50,6 +50,17 @@ __all__ = [
 ]
 
 
+def _is_peer_id(destination: str) -> bool:
+    """Return whether a message destination names a HiveMind peer.
+
+    HiveMind client connections mint peer IDs as ``name::session_id``, with
+    an optional suffix for duplicate live connections. OVOS also uses the
+    destination field for local bus labels such as ``skills`` and skill IDs;
+    those labels are not disconnected HiveMind peers.
+    """
+    return "::" in destination
+
+
 class _TransientWebsocketDisconnectFilter(logging.Filter):
     """Downgrade websocket-client's pre-callback rollout noise to INFO.
 
@@ -1560,10 +1571,15 @@ class OVOSAgentProtocol(AgentProtocol):
                     )
                     self._send_to_client(peer, client, msg)
             for peer in unmatched:
-                LOG.warning(
-                    f"{message.msg_type} - destination peer not connected: "
-                    f"{peer}"
-                )
+                if _is_peer_id(peer):
+                    LOG.warning(
+                        f"{message.msg_type} - destination peer not connected: "
+                        f"{peer}"
+                    )
+                else:
+                    LOG.debug(
+                        f"{message.msg_type} - destination is not a peer: {peer}"
+                    )
 
     def _observe_skill_lifecycle(self, message: Message) -> None:
         """Measure correlated OVOS handler execution without forwarding it.
