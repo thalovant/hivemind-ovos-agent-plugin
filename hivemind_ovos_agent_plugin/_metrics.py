@@ -67,11 +67,41 @@ class LatencyHistogram:
 BUS_WRITE_QUEUE = LatencyHistogram("hivemind_bus_write_queue_ms")
 BUS_WRITE = LatencyHistogram("hivemind_bus_write_ms")
 SKILL_HANDLER = LatencyHistogram("hivemind_skill_handler_ms")
+RUNTIME_BUS_PUBLIC_REPLY = LatencyHistogram(
+    "hivemind_runtime_bus_public_reply_ms"
+)
+RUNTIME_BUS_SKILL_LIFECYCLE = LatencyHistogram(
+    "hivemind_runtime_bus_skill_lifecycle_ms"
+)
+RUNTIME_BUS_INTENT_LIFECYCLE = LatencyHistogram(
+    "hivemind_runtime_bus_intent_lifecycle_ms"
+)
+RUNTIME_BUS_AUDIO_LIFECYCLE = LatencyHistogram(
+    "hivemind_runtime_bus_audio_lifecycle_ms"
+)
+RUNTIME_BUS_FALLBACK_COORDINATION = LatencyHistogram(
+    "hivemind_runtime_bus_fallback_coordination_ms"
+)
+RUNTIME_BUS_CONTROL = LatencyHistogram(
+    "hivemind_runtime_bus_control_ms"
+)
+RUNTIME_BUS_OTHER = LatencyHistogram("hivemind_runtime_bus_other_ms")
 
 
 def performance_histograms() -> dict[str, dict[str, object]]:
     """Return all OVOS-agent performance histograms."""
     return {
         histogram.name: histogram.snapshot()
-        for histogram in (BUS_WRITE_QUEUE, BUS_WRITE, SKILL_HANDLER)
+        for histogram in (
+            BUS_WRITE_QUEUE,
+            BUS_WRITE,
+            SKILL_HANDLER,
+            RUNTIME_BUS_PUBLIC_REPLY,
+            RUNTIME_BUS_SKILL_LIFECYCLE,
+            RUNTIME_BUS_INTENT_LIFECYCLE,
+            RUNTIME_BUS_AUDIO_LIFECYCLE,
+            RUNTIME_BUS_FALLBACK_COORDINATION,
+            RUNTIME_BUS_CONTROL,
+            RUNTIME_BUS_OTHER,
+        )
     }

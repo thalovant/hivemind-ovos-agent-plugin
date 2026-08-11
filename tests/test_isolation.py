@@ -5,16 +5,49 @@ from unittest.mock import patch
 import pytest
 from ovos_bus_client.message import Message
 from hivemind_bus_client.message import HiveMessageType
-from hivemind_ovos_agent_plugin._metrics import SKILL_HANDLER
+from hivemind_ovos_agent_plugin._metrics import (
+    RUNTIME_BUS_AUDIO_LIFECYCLE,
+    RUNTIME_BUS_CONTROL,
+    RUNTIME_BUS_FALLBACK_COORDINATION,
+    RUNTIME_BUS_INTENT_LIFECYCLE,
+    RUNTIME_BUS_PUBLIC_REPLY,
+    RUNTIME_BUS_SKILL_LIFECYCLE,
+    SKILL_HANDLER,
+)
 
 
-def _ovos_internal(msg_type, destination=None, data=None):
+def _ovos_internal(msg_type, destination=None, data=None, context=None):
     """Build the serialized JSON that handle_internal_mycroft expects."""
-    msg = Message(msg_type, data or {}, {"destination": destination} if destination is not None else {})
+    context = dict(context or {})
+    if destination is not None:
+        context["destination"] = destination
+    msg = Message(msg_type, data or {}, context)
     return msg.serialize()
 
 
 class TestClientIsolation:
+    @pytest.mark.parametrize(("message_type", "histogram"), [
+        ("speak", RUNTIME_BUS_PUBLIC_REPLY),
+        ("ovos.utterance.handled", RUNTIME_BUS_PUBLIC_REPLY),
+        ("mycroft.skill.handler.start", RUNTIME_BUS_SKILL_LIFECYCLE),
+        ("ovos.intent.matched", RUNTIME_BUS_INTENT_LIFECYCLE),
+        ("ovos.intent.handler.start", RUNTIME_BUS_INTENT_LIFECYCLE),
+        ("skill-id.activate", RUNTIME_BUS_INTENT_LIFECYCLE),
+        ("recognizer_loop:audio_output_start", RUNTIME_BUS_AUDIO_LIFECYCLE),
+        ("recognizer_loop:utterance_start", RUNTIME_BUS_AUDIO_LIFECYCLE),
+        ("ovos.skills.fallback.ping", RUNTIME_BUS_FALLBACK_COORDINATION),
+        ("thalovant.runtime.query.prepared", RUNTIME_BUS_CONTROL),
+        ("recognizer_loop:utterance", RUNTIME_BUS_CONTROL),
+        ("recognizer_loop:audio_output_end", RUNTIME_BUS_AUDIO_LIFECYCLE),
+    ])
+    def test_runtime_bus_events_use_fixed_metric_categories(
+            self, agent, message_type, histogram):
+        initial = histogram.snapshot()["count"]
+
+        agent.handle_internal_mycroft(_ovos_internal(message_type))
+
+        assert histogram.snapshot()["count"] == initial + 1
+
     def test_private_handler_lifecycle_is_measured_once(self, agent):
         initial = SKILL_HANDLER.snapshot()["count"]
         context = {
@@ -34,9 +67,21 @@ class TestClientIsolation:
     @pytest.mark.parametrize("message_type", [
         "mycroft.skill.handler.start",
         "mycroft.skill.handler.complete",
+        "ovos.intent.matched",
+        "ovos.intent.handler.start",
+        "ovos.intent.handler.complete",
+        "skill-id.activate",
         "ovos.skills.fallback.ping",
         "ovos.skills.fallback.skill-id.request",
         "thalovant.runtime.query.prepared",
+        "recognizer_loop:utterance",
+        "recognizer_loop:audio_output_start",
+        "recognizer_loop:audio_output_end",
+        "recognizer_loop:utterance_start",
+        "mycroft.intents.is_ready",
+        "mycroft.skills.is_ready.response",
+        "mycroft.thalovant-skill-weather.thalovant.is_ready",
+        "mycroft.ovos-skill-volume.openvoiceos.is_ready.response",
     ])
     def test_runtime_private_events_never_reach_clients(
             self, agent, make_client, message_type):
@@ -48,6 +93,33 @@ class TestClientIsolation:
         )
 
         alice.send.assert_not_called()
+
+    def test_runtime_intent_dispatch_never_reaches_client(
+            self, agent, make_client):
+        alice = make_client("ws://alice")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+        initial = RUNTIME_BUS_INTENT_LIFECYCLE.snapshot()["count"]
+
+        agent.handle_internal_mycroft(_ovos_internal(
+            "skill-id:current.weather",
+            destination="ws://alice",
+            context={"skill_id": "skill-id", "pipeline_id": "padatious"},
+        ))
+
+        alice.send.assert_not_called()
+        assert RUNTIME_BUS_INTENT_LIFECYCLE.snapshot()["count"] == initial + 1
+
+    def test_skill_custom_reply_remains_routable(self, agent, make_client):
+        alice = make_client("ws://alice")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+
+        agent.handle_internal_mycroft(_ovos_internal(
+            "skill-id.custom.response",
+            destination="ws://alice",
+            context={"skill_id": "skill-id", "pipeline_id": "padatious"},
+        ))
+
+        alice.send.assert_called_once()
 
     @pytest.mark.parametrize("message_type", [
         "speak",
@@ -114,8 +186,11 @@ class TestClientIsolation:
                 _ovos_internal("speak", destination=stale_peer)
             )
 
-        warning.assert_called_once()
-        assert stale_peer in warning.call_args.args[0]
+        warning.assert_called_once_with(
+            "%s - destination peer not connected: %s",
+            "speak",
+            stale_peer,
+        )
 
     @pytest.mark.parametrize("destination", [
         "audio",
@@ -140,7 +215,9 @@ class TestClientIsolation:
 
         warning.assert_not_called()
         debug.assert_called_once_with(
-            f"speak - destination is not a peer: {destination}"
+            "%s - destination is not a peer: %s",
+            "speak",
+            destination,
         )
         alice.send.assert_not_called()
 

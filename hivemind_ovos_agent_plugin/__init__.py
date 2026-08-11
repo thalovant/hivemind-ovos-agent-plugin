@@ -1,13 +1,16 @@
 import dataclasses
+import hashlib
+import json
 import logging
 import math
 import queue
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import Future
 from copy import deepcopy
 from threading import Event, Lock, Thread, current_thread
-from typing import Callable, Dict, Any, Iterator, Optional, Set
+from typing import Callable, Dict, Any, Iterator, Optional, Set, Tuple
 
 from ovos_bus_client import MessageBusClient
 from ovos_bus_client.client.client import _maybe_encrypt
@@ -18,7 +21,8 @@ from ovos_utils import json_dumps
 from ovos_utils.fakebus import FakeBus
 from ovos_utils.log import LOG
 from pyee import EventEmitter
-from websocket import (WebSocketConnectionClosedException, WebSocketException,
+from websocket import (WebSocketAddressException,
+                       WebSocketConnectionClosedException, WebSocketException,
                        WebSocketTimeoutException)
 
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
@@ -33,6 +37,13 @@ from hivemind_ovos_agent_plugin.policy import (AddBlacklistedIntent,
 from hivemind_ovos_agent_plugin._metrics import (
     BUS_WRITE,
     BUS_WRITE_QUEUE,
+    RUNTIME_BUS_AUDIO_LIFECYCLE,
+    RUNTIME_BUS_CONTROL,
+    RUNTIME_BUS_FALLBACK_COORDINATION,
+    RUNTIME_BUS_INTENT_LIFECYCLE,
+    RUNTIME_BUS_OTHER,
+    RUNTIME_BUS_PUBLIC_REPLY,
+    RUNTIME_BUS_SKILL_LIFECYCLE,
     SKILL_HANDLER,
 )
 from hivemind_ovos_agent_plugin.version import __version__
@@ -184,6 +195,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
             ConnectionError,
             PermissionError,
             TimeoutError,
+            WebSocketAddressException,
             WebSocketConnectionClosedException,
             WebSocketTimeoutException,
         ))
@@ -855,6 +867,18 @@ class OVOSAgentProtocol(AgentProtocol):
     _owned_bus: Optional[MessageBusClient] = dataclasses.field(
         default=None, init=False, repr=False, compare=False
     )
+    _runtime_buses: Dict[str, MessageBusClient] = dataclasses.field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _owned_buses: Tuple[MessageBusClient, ...] = dataclasses.field(
+        default_factory=tuple, init=False, repr=False, compare=False
+    )
+    _reply_dedupe: OrderedDict = dataclasses.field(
+        default_factory=OrderedDict, init=False, repr=False, compare=False
+    )
+    _reply_dedupe_lock: Lock = dataclasses.field(
+        default_factory=Lock, init=False, repr=False, compare=False
+    )
     _active_query_scopes: Dict[str, Set[str]] = dataclasses.field(
         default_factory=dict, init=False, repr=False
     )
@@ -885,54 +909,230 @@ class OVOSAgentProtocol(AgentProtocol):
 
     def __post_init__(self):
         if not self.bus or isinstance(self.bus, FakeBus):
-            ovos_bus_address = self.config.get("host") or "127.0.0.1"
-            ovos_bus_port = self.config.get("port") or 8181
+            runtime_shards = self._configured_runtime_shards()
             timeout = self._connection_timeout()
-            self.bus = _RuntimeMessageBusClient(
-                host=ovos_bus_address,
-                port=ovos_bus_port,
-                emitter=EventEmitter(),
-                reconnect_error_after=self.config.get(
-                    "reconnect_error_after", 120
-                ),
-                message_send_timeout=self.config.get(
-                    "message_send_timeout", 15
-                ),
-                delivery_recovery_timeout=self.config.get(
-                    "delivery_recovery_timeout", 20
-                ),
-                bus_write_queue_size=self.config.get(
-                    "bus_write_queue_size", 256
-                ),
-                ping_interval=self.config.get("ping_interval", 15),
-                ping_timeout=self.config.get("ping_timeout", 5),
-            )
+            self._runtime_buses = {}
+            try:
+                for shard_id, host, port in runtime_shards:
+                    self._runtime_buses[shard_id] = self._create_runtime_bus(
+                        shard_id=shard_id,
+                        host=host,
+                        port=port,
+                    )
+            except Exception:
+                for bus in self._runtime_buses.values():
+                    bus.close()
+                raise
+            self._owned_buses = tuple(self._runtime_buses.values())
+            self.bus = self._owned_buses[0]
+            self._owned_bus = self.bus
             # Install one immutable set of runtime-bus handlers before the
             # websocket receive thread starts. Per-query ``on``/``remove``
             # mutations can deadlock pyee's non-reentrant emitter lock while
             # that receive thread is dispatching a message.
-            self._ensure_query_dispatchers(self.bus)
-            self.bus.run_in_thread()
-            self._owned_bus = self.bus
+            for bus in self._owned_buses:
+                self._ensure_query_dispatchers(bus)
+            self.register_bus_handlers()
+            for bus in self._owned_buses:
+                bus.run_in_thread()
             # Bound startup without taking the whole HiveMind node down. The
-            # managed client keeps reconnecting in the background; get_bus()
-            # reports it unavailable immediately until that succeeds.
-            if not self.bus.connected_event.wait(timeout):
-                LOG.error(
-                    f"Could not connect to the OVOS messagebus at "
-                    f"ws://{ovos_bus_address}:{ovos_bus_port} within {timeout}s. "
-                    "Retrying in the background; clients will receive "
-                    "backend_unavailable until it connects."
-                )
+            # managed clients keep reconnecting in the background; get_bus()
+            # reports the selected shard unavailable instead of moving an
+            # in-flight client request to another runtime.
+            deadline = time.monotonic() + timeout
+            for shard_id, bus in self._runtime_buses.items():
+                remaining = max(0.0, deadline - time.monotonic())
+                if not bus.connected_event.wait(remaining):
+                    host = getattr(bus, "_hivemind_runtime_host", "unknown")
+                    port = getattr(bus, "_hivemind_runtime_port", 8181)
+                    LOG.error(
+                        "Could not connect to OVOS runtime shard %s at "
+                        "ws://%s:%s within the shared %.1fs startup window. "
+                        "Retrying in the background; assigned clients will "
+                        "receive backend_unavailable until it connects.",
+                        shard_id,
+                        host,
+                        port,
+                        timeout,
+                    )
+            LOG.info(
+                "OVOS runtime routing ready: shards=%s strategy=rendezvous",
+                ",".join(self._runtime_buses),
+            )
         else:
             self._owned_bus = None
+            self._owned_buses = ()
+            self._runtime_buses = {"default": self.bus}
             self._ensure_query_dispatchers(self.bus)
-        self.register_bus_handlers()
+            self.register_bus_handlers()
+
+    def _configured_runtime_shards(self) -> Tuple[Tuple[str, str, int], ...]:
+        """Return explicit, unique runtime endpoints in stable order.
+
+        A repeated connection to one broadcast bus receives the same ``speak``
+        frame more than once. Sharding therefore accepts only named, unique
+        endpoints; the old ``pool_size`` shape is rejected instead of silently
+        recreating the duplicate-reply topology.
+        """
+        raw = self.config.get("runtime_shards")
+        if raw is None:
+            try:
+                legacy_pool_size = int(self.config.get("pool_size", 1))
+            except (TypeError, ValueError):
+                legacy_pool_size = 1
+            if legacy_pool_size > 1:
+                raise ValueError(
+                    "pool_size cannot safely identify independent OVOS "
+                    "runtimes; configure unique runtime_shards instead"
+                )
+            host = str(self.config.get("host") or "127.0.0.1").strip()
+            port = self._runtime_port(self.config.get("port", 8181))
+            return (("default", host, port),)
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("runtime_shards must be a non-empty list")
+        if len(raw) > 64:
+            raise ValueError("runtime_shards supports at most 64 endpoints")
+
+        shards = []
+        shard_ids = set()
+        endpoints = set()
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"runtime_shards[{index}] must be an object"
+                )
+            shard_id = str(item.get("id") or "").strip()
+            host = str(item.get("host") or "").strip()
+            port = self._runtime_port(
+                item.get("port", self.config.get("port", 8181))
+            )
+            if not shard_id or not host:
+                raise ValueError(
+                    f"runtime_shards[{index}] requires non-empty id and host"
+                )
+            if shard_id in shard_ids:
+                raise ValueError(f"duplicate runtime shard id: {shard_id}")
+            # DNS hostnames are case-insensitive and an absolute trailing dot
+            # names the same endpoint. Reject those obvious aliases instead
+            # of opening two receivers on one broadcast messagebus.
+            endpoint = (host.casefold().rstrip("."), port)
+            if endpoint in endpoints:
+                raise ValueError(
+                    "runtime_shards endpoints must be unique; repeated "
+                    f"broadcast endpoint ws://{host}:{port} is unsafe"
+                )
+            shard_ids.add(shard_id)
+            endpoints.add(endpoint)
+            shards.append((shard_id, host, port))
+        return tuple(shards)
+
+    @staticmethod
+    def _runtime_port(value) -> int:
+        """Return a valid runtime messagebus port or fail configuration."""
+        try:
+            port = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("runtime shard port must be an integer") from error
+        if not 1 <= port <= 65535:
+            raise ValueError("runtime shard port must be between 1 and 65535")
+        return port
+
+    def _create_runtime_bus(self, *, shard_id: str, host: str,
+                            port: int) -> _RuntimeMessageBusClient:
+        """Create one owned bus for one independently isolated runtime."""
+        bus = _RuntimeMessageBusClient(
+            host=host,
+            port=port,
+            emitter=EventEmitter(),
+            reconnect_error_after=self.config.get(
+                "reconnect_error_after", 120
+            ),
+            message_send_timeout=self.config.get(
+                "message_send_timeout", 15
+            ),
+            delivery_recovery_timeout=self.config.get(
+                "delivery_recovery_timeout", 20
+            ),
+            bus_write_queue_size=self.config.get(
+                "bus_write_queue_size", 256
+            ),
+            ping_interval=self.config.get("ping_interval", 15),
+            ping_timeout=self.config.get("ping_timeout", 5),
+        )
+        bus._hivemind_runtime_shard_id = shard_id
+        bus._hivemind_runtime_host = host
+        bus._hivemind_runtime_port = port
+        return bus
+
+    def _all_runtime_buses(self) -> Tuple[MessageBusClient, ...]:
+        """Return configured buses, including legacy test instances."""
+        buses = getattr(self, "_runtime_buses", None)
+        if isinstance(buses, dict) and buses:
+            return tuple(buses.values())
+        return (self.bus,)
+
+    def _select_runtime_bus(self, routing_key: str):
+        """Return a shard ID and bus using deterministic rendezvous hashing."""
+        buses = getattr(self, "_runtime_buses", None)
+        if not isinstance(buses, dict) or not buses:
+            shard_id = "default"
+            bus = self.bus
+        elif len(buses) == 1:
+            shard_id, bus = next(iter(buses.items()))
+        else:
+            key = str(routing_key or "default")
+            shard_id, bus = max(
+                buses.items(),
+                key=lambda item: hashlib.blake2b(
+                    f"{key}\0{item[0]}".encode("utf-8"),
+                    digest_size=16,
+                ).digest(),
+            )
+            LOG.debug("OVOS runtime shard selected: %s", shard_id)
+        return shard_id, bus
+
+    def _runtime_bus_for_key(self, routing_key: str) -> MessageBusClient:
+        """Select one available runtime without replaying on another shard."""
+        shard_id, bus = self._select_runtime_bus(routing_key)
+        if self._owned_runtime_bus_is_available(bus):
+            return bus
+        raise ConnectionError(
+            f"OVOS messagebus shard {shard_id} is not connected"
+        )
+
+    def _owned_runtime_bus_is_available(self, bus) -> bool:
+        """Return whether an owned bus is live; injected buses stay caller-owned."""
+        owned = getattr(self, "_owned_buses", ())
+        if not any(candidate is bus for candidate in owned):
+            owned_bus = getattr(self, "_owned_bus", None)
+            if bus is not owned_bus:
+                return True
+        return bool(
+            bus.connected_event.is_set()
+            and (not isinstance(bus, _RuntimeMessageBusClient)
+                 or bus._transport_is_open())
+        )
 
     def register_bus_handlers(self):
         LOG.debug("registering internal OVOS bus handlers")
-        self.bus.on("hive.send.downstream", self.handle_send)
-        self.bus.on("message", self.handle_internal_mycroft)  # catch all
+        for bus in self._all_runtime_buses():
+            bus.on(
+                "hive.send.downstream",
+                self._bind_bus_handler(self.handle_send, bus),
+            )
+            bus.on(
+                "message",
+                self._bind_bus_handler(self.handle_internal_mycroft, bus),
+            )
+
+    @staticmethod
+    def _bind_bus_handler(callback, bus):
+        """Bind an event to its originating runtime bus."""
+        def _handler(message, _bus=bus):
+            return callback(message, bus=_bus)
+
+        _handler.__name__ = callback.__name__
+        return _handler
 
     @staticmethod
     def _normalize_timeout(raw, default: float = 10.0) -> float:
@@ -948,29 +1148,51 @@ class OVOSAgentProtocol(AgentProtocol):
         return self._normalize_timeout(self.config.get("connection_timeout", 10))
 
     def get_bus(self, client=None) -> FakeBus | MessageBusClient:
-        """Return a usable bus without blocking Core's shared IOLoop thread."""
-        bus = self.bus
-        if bus is not self._owned_bus:
-            return bus
-        if (bus.connected_event.is_set()
-                and (not isinstance(bus, _RuntimeMessageBusClient)
-                     or bus._transport_is_open())):
-            return bus
-        raise ConnectionError("OVOS messagebus is not connected")
+        """Return one stable client shard without blocking Core's IOLoop.
+
+        ``hivemind-core`` retains ownership of message emission and calls this
+        documented AgentProtocol seam for every injection. The agent only
+        selects the independently isolated runtime bus.
+        """
+        peer = getattr(client, "peer", None)
+        return self._runtime_bus_for_key(peer or "default")
 
     def wait_for_bus(self, timeout: Optional[float] = None) -> bool:
-        """Wait for a usable owned runtime bus from maintenance code."""
-        if self.bus is not self._owned_bus:
+        """Wait for every owned runtime transport within one shared timeout."""
+        owned = getattr(self, "_owned_buses", ())
+        if not owned:
+            owned_bus = getattr(self, "_owned_bus", None)
+            owned = (owned_bus,) if owned_bus is not None else ()
+        if not owned:
             return True
         if timeout is None:
             timeout = self._connection_timeout()
         else:
             timeout = self._normalize_timeout(timeout)
-        if isinstance(self.bus, _RuntimeMessageBusClient):
-            return self.bus._wait_for_live_transport(
-                time.monotonic() + timeout
-            )
-        return self.bus.connected_event.wait(timeout)
+        if len(owned) == 1:
+            bus = owned[0]
+            if isinstance(bus, _RuntimeMessageBusClient):
+                return bus._wait_for_live_transport(
+                    time.monotonic() + timeout
+                )
+            return bus.connected_event.wait(timeout)
+        deadline = time.monotonic() + timeout
+        for bus in owned:
+            if isinstance(bus, _RuntimeMessageBusClient):
+                if not bus._wait_for_live_transport(deadline):
+                    return False
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            if not bus.connected_event.wait(remaining):
+                return False
+        return True
+
+    def _peer_owns_bus(self, peer: str, bus) -> bool:
+        """Return whether a runtime bus owns the peer's deterministic shard."""
+        if bus is None or len(self._all_runtime_buses()) == 1:
+            return True
+        _, selected = self._select_runtime_bus(peer)
+        return selected is bus
 
     def _send_to_client(self, peer: str, client, hmessage: HiveMessage) -> bool:
         """Send a HiveMessage without letting stale sockets break bus dispatch."""
@@ -990,6 +1212,21 @@ class OVOSAgentProtocol(AgentProtocol):
         ``speak`` replies until ``ovos.utterance.handled`` (or 10s inactivity),
         correlated by a fresh query-scoped session so they are not reverse-routed."""
         yield from self._stream_query(utterance, lang)
+
+    def answer_query(self, utterance: str, lang: str,
+                     client=None) -> "Iterator[Optional[str]]":
+        """Stream a QUERY answer from the originating client's runtime.
+
+        This is the client-aware ``AgentProtocol`` contract. Keeping routing
+        here ensures direct users of the public plugin API receive the same
+        shard ownership as HiveMind Core's richer ``answer_query_message``
+        path.
+        """
+        yield from self._stream_query(
+            utterance,
+            lang,
+            bus=self.get_bus(client),
+        )
 
     def answer_query_message(self, message: Message,
                              client=None) -> "Iterator[Optional[Any]]":
@@ -1290,7 +1527,7 @@ class OVOSAgentProtocol(AgentProtocol):
         import uuid
         qid = uuid.uuid4().hex
         q: "queue.Queue" = queue.Queue()
-        query_bus = bus or self.bus
+        query_bus = bus or self._runtime_bus_for_key(qid)
         config = getattr(self, "config", None)
         config = config if isinstance(config, dict) else {}
 
@@ -1503,7 +1740,7 @@ class OVOSAgentProtocol(AgentProtocol):
             self._unregister_active_query(qid)
 
     # mycroft handlers - from master -> slave
-    def handle_send(self, message: Message):
+    def handle_send(self, message: Message, bus=None):
         """ovos wants to send a HiveMessage.
 
         A device can be both a master and a slave; downstream messages are handled here.
@@ -1517,69 +1754,224 @@ class OVOSAgentProtocol(AgentProtocol):
 
         if msg_type in [HiveMessageType.PROPAGATE, HiveMessageType.BROADCAST]:
             for peer, client in list(self.clients.items()):
-                self._send_to_client(peer, client, hmessage)
+                if self._peer_owns_bus(peer, bus):
+                    self._send_to_client(peer, client, hmessage)
         elif msg_type == HiveMessageType.ESCALATE:
             # only slaves can escalate, ignore silently
             pass
-        elif peer:
+        elif peer and self._peer_owns_bus(peer, bus):
             client = self.clients.get(peer)
             if client is not None:
                 self._send_to_client(peer, client, hmessage)
             else:
                 LOG.error("That client is not connected")
-                self.bus.emit(
+                (bus or self.bus).emit(
                     message.forward(
                         "hive.client.send.error",
                         {"error": "That client is not connected", "peer": peer},
                     )
                 )
 
-    def handle_internal_mycroft(self, message: str):
+    def handle_internal_mycroft(self, message: str, bus=None):
         """Forward internal messages to clients if they are the target.
 
         Client isolation happens here: clients only get responses to their own messages.
         """
-        message = Message.deserialize(message)
+        started = time.monotonic()
+        histogram = RUNTIME_BUS_OTHER
+        try:
+            if isinstance(message, str):
+                message = Message.deserialize(message)
+            histogram = self._runtime_bus_event_histogram(message)
+            self._handle_runtime_bus_message(message, bus)
+        finally:
+            histogram.observe_ms((time.monotonic() - started) * 1000)
+
+    def _handle_runtime_bus_message(self, message: Message, bus=None) -> None:
+        """Apply lifecycle accounting and route one decoded runtime event."""
         self._observe_skill_lifecycle(message)
-        if self._is_runtime_private_event(message.msg_type):
+        if self._is_runtime_private_message(message):
             return
         target_peers = message.context.get("destination") or []
         if not isinstance(target_peers, list):
             target_peers = [target_peers]
+        if not target_peers:
+            return
 
-        if target_peers:
-            unmatched = set(target_peers)
-            session = message.context.get("session")
-            if isinstance(session, dict):
-                # OVOS-SESSION-1 §2.1 requires registered null fields to be
-                # omitted. Preserve unknown extension fields verbatim (§2.4).
-                message.context["session"] = {
-                    key: value
-                    for key, value in session.items()
-                    if value is not None or key not in SESSION1_REGISTERED_FIELDS
-                }
-            for peer, client in list(self.clients.items()):
-                if peer in target_peers:
-                    unmatched.discard(peer)
-                    LOG.debug(f"{message.msg_type} - destination: {peer}")
-                    message.context["source"] = "hive"
-                    msg = HiveMessage(
-                        HiveMessageType.BUS,
-                        source_peer=peer,
-                        target_peers=target_peers,
-                        payload=message,
-                    )
-                    self._send_to_client(peer, client, msg)
-            for peer in unmatched:
-                if _is_peer_id(peer):
-                    LOG.warning(
-                        f"{message.msg_type} - destination peer not connected: "
-                        f"{peer}"
-                    )
-                else:
-                    LOG.debug(
-                        f"{message.msg_type} - destination is not a peer: {peer}"
-                    )
+        for destination in target_peers:
+            if (isinstance(destination, str) and destination
+                    and not _is_peer_id(destination)
+                    and destination not in self.clients):
+                LOG.debug(
+                    "%s - destination is not a peer: %s",
+                    message.msg_type,
+                    destination,
+                )
+
+        session = message.context.get("session")
+        if isinstance(session, dict):
+            # OVOS-SESSION-1 §2.1 requires registered null fields to be
+            # omitted. Preserve unknown extension fields verbatim (§2.4).
+            message.context["session"] = {
+                key: value
+                for key, value in session.items()
+                if value is not None or key not in SESSION1_REGISTERED_FIELDS
+            }
+        owned_targets = []
+        for peer in target_peers:
+            if (isinstance(peer, str) and peer
+                    and (_is_peer_id(peer) or peer in self.clients)
+                    and peer not in owned_targets
+                    and self._peer_owns_bus(peer, bus)):
+                owned_targets.append(peer)
+        unmatched = set(owned_targets)
+        for peer in owned_targets:
+            client = self.clients.get(peer)
+            if client is None:
+                continue
+            unmatched.discard(peer)
+            if self._is_duplicate_public_reply(peer, message):
+                LOG.warning(
+                    "Dropped duplicate OVOS reply %s for %s",
+                    message.msg_type,
+                    peer,
+                )
+                continue
+            LOG.debug("%s - destination: %s", message.msg_type, peer)
+            message.context["source"] = "hive"
+            msg = HiveMessage(
+                HiveMessageType.BUS,
+                source_peer=peer,
+                target_peers=target_peers,
+                payload=message,
+            )
+            self._send_to_client(peer, client, msg)
+        for peer in unmatched:
+            if _is_peer_id(peer):
+                LOG.warning(
+                    "%s - destination peer not connected: %s",
+                    message.msg_type,
+                    peer,
+                )
+
+    @classmethod
+    def _runtime_bus_event_histogram(cls, message: Message):
+        """Select one fixed-cardinality runtime event metric.
+
+        The categories deliberately describe protocol roles instead of skill
+        or message names so a scrape cannot grow with installed plugins or
+        user traffic.
+        """
+        message_type = message.msg_type
+        if message_type in {
+            "speak",
+            "ovos.utterance.speak",
+            "ovos.utterance.handled",
+        }:
+            return RUNTIME_BUS_PUBLIC_REPLY
+        if message_type.startswith("mycroft.skill.handler."):
+            return RUNTIME_BUS_SKILL_LIFECYCLE
+        if (message_type == "ovos.intent.matched"
+                or message_type.startswith("ovos.intent.handler.")
+                or cls._is_runtime_intent_dispatch(message)):
+            return RUNTIME_BUS_INTENT_LIFECYCLE
+        if message_type in {
+            "recognizer_loop:audio_output_start",
+            "recognizer_loop:audio_output_end",
+            "recognizer_loop:utterance_start",
+        }:
+            return RUNTIME_BUS_AUDIO_LIFECYCLE
+        if (message_type.startswith("ovos.skills.fallback.")
+                or message_type.endswith((".fallback.ping", ".fallback.pong"))):
+            return RUNTIME_BUS_FALLBACK_COORDINATION
+        if (message_type.startswith("thalovant.runtime.")
+                or message_type in {
+                    "connected",
+                    "gui.status.request",
+                    "hive.client.connect",
+                    "ovos.session.sync",
+                    "recognizer_loop:utterance",
+                }):
+            return RUNTIME_BUS_CONTROL
+        return RUNTIME_BUS_OTHER
+
+    @staticmethod
+    def _is_runtime_intent_dispatch(message: Message) -> bool:
+        """Return whether an event invokes or activates a runtime skill.
+
+        OVOS dispatches an intent on ``<skill_id>:<intent_name>`` and emits
+        ``<skill_id>.activate`` immediately before it. Both messages retain
+        the requesting satellite as their destination because they derive
+        from the admitted utterance envelope, but they are runtime-internal
+        inputs to the skill rather than replies to the satellite.
+        """
+        message_type = message.msg_type
+        if message_type.endswith(".activate"):
+            return True
+        skill_id = message.context.get("skill_id")
+        return bool(
+            isinstance(skill_id, str)
+            and skill_id
+            and message_type.startswith(f"{skill_id}:")
+        )
+
+    def _is_duplicate_public_reply(self, peer: str, message: Message) -> bool:
+        """Suppress an exact repeated correlated reply for a short window.
+
+        Runtime-bus ownership is the primary duplicate barrier. This bounded
+        guard covers endpoint mistakes and broker retries without suppressing
+        uncorrelated conversational messages that happen to have equal text.
+        """
+        if len(self._all_runtime_buses()) < 2:
+            return False
+        if not self._message_query_ids(message):
+            return False
+        if not hasattr(self, "_reply_dedupe"):
+            self._reply_dedupe = OrderedDict()
+            self._reply_dedupe_lock = Lock()
+        try:
+            ttl = float(self.config.get("reply_dedupe_seconds", 5.0))
+        except (TypeError, ValueError):
+            ttl = 5.0
+        ttl = ttl if math.isfinite(ttl) and ttl > 0 else 5.0
+        try:
+            limit = int(self.config.get("reply_dedupe_max_entries", 8192))
+        except (TypeError, ValueError):
+            limit = 8192
+        limit = min(max(limit, 1), 65536)
+        context = dict(message.context or {})
+        context.pop("source", None)
+        canonical = json.dumps(
+            {
+                "type": message.msg_type,
+                "data": message.data,
+                "context": context,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        digest = hashlib.blake2b(
+            canonical.encode("utf-8"),
+            digest_size=16,
+        ).digest()
+        fingerprint = (peer, digest)
+        now = time.monotonic()
+        cutoff = now - ttl
+        with self._reply_dedupe_lock:
+            while self._reply_dedupe:
+                _, observed = next(iter(self._reply_dedupe.items()))
+                if observed > cutoff:
+                    break
+                self._reply_dedupe.popitem(last=False)
+            if fingerprint in self._reply_dedupe:
+                self._reply_dedupe.move_to_end(fingerprint)
+                self._reply_dedupe[fingerprint] = now
+                return True
+            self._reply_dedupe[fingerprint] = now
+            while len(self._reply_dedupe) > limit:
+                self._reply_dedupe.popitem(last=False)
+        return False
 
     def _observe_skill_lifecycle(self, message: Message) -> None:
         """Measure correlated OVOS handler execution without forwarding it.
@@ -1652,11 +2044,33 @@ class OVOSAgentProtocol(AgentProtocol):
         """
         if message_type.startswith("mycroft.skill.handler."):
             return True
+        if (message_type == "ovos.intent.matched"
+                or message_type.startswith("ovos.intent.handler.")):
+            return True
+        if message_type in {
+            "recognizer_loop:audio_output_start",
+            "recognizer_loop:audio_output_end",
+            "recognizer_loop:utterance_start",
+        }:
+            return True
         if message_type.startswith("thalovant.runtime."):
             return True
         if message_type.startswith("ovos.skills.fallback."):
             return True
+        if message_type == "recognizer_loop:utterance":
+            return True
+        if (message_type.startswith("mycroft.")
+                and message_type.endswith((".is_ready", ".is_ready.response"))):
+            return True
         return message_type.endswith((".fallback.ping", ".fallback.pong"))
+
+    @classmethod
+    def _is_runtime_private_message(cls, message: Message) -> bool:
+        """Return whether a decoded runtime message is not a client reply."""
+        return (
+            cls._is_runtime_private_event(message.msg_type)
+            or cls._is_runtime_intent_dispatch(message)
+        )
 
 
 # back-compat alias for the old class name shipped from ovos-bus-client
