@@ -130,12 +130,18 @@ class TestClientIsolation:
         alice = make_client("voice_sat::c0ffee")
         agent.hm_protocol.clients = {"voice_sat::c0ffee": alice}
 
-        with patch("hivemind_ovos_agent_plugin.LOG.warning") as warning:
+        with (
+            patch("hivemind_ovos_agent_plugin.LOG.warning") as warning,
+            patch("hivemind_ovos_agent_plugin.LOG.debug") as debug,
+        ):
             agent.handle_internal_mycroft(
                 _ovos_internal("speak", destination=destination)
             )
 
         warning.assert_not_called()
+        debug.assert_called_once_with(
+            f"speak - destination is not a peer: {destination}"
+        )
         alice.send.assert_not_called()
 
     def test_message_addressed_to_stale_peer_is_dropped_without_raising(self, agent, make_client):
