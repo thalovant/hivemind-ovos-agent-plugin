@@ -105,16 +105,44 @@ class TestClientIsolation:
         alice.send.assert_not_called()
 
     def test_unknown_destination_is_diagnosed(self, agent, make_client):
-        alice = make_client("ws://alice")
-        agent.hm_protocol.clients = {"ws://alice": alice}
+        alice = make_client("voice_sat::c0ffee")
+        agent.hm_protocol.clients = {"voice_sat::c0ffee": alice}
+        stale_peer = "voice_sat::deadbeef"
 
         with patch("hivemind_ovos_agent_plugin.LOG.warning") as warning:
             agent.handle_internal_mycroft(
-                _ovos_internal("speak", destination="ws://stranger")
+                _ovos_internal("speak", destination=stale_peer)
             )
 
         warning.assert_called_once()
-        assert "ws://stranger" in warning.call_args.args[0]
+        assert stale_peer in warning.call_args.args[0]
+
+    @pytest.mark.parametrize("destination", [
+        "audio",
+        "enclosure",
+        "skills",
+        "ovos.gui",
+        "OVOS Runtime Operator",
+        "ovos-skill-date-time.openvoiceos",
+    ])
+    def test_ordinary_ovos_destinations_do_not_warn(
+            self, agent, make_client, destination):
+        alice = make_client("voice_sat::c0ffee")
+        agent.hm_protocol.clients = {"voice_sat::c0ffee": alice}
+
+        with (
+            patch("hivemind_ovos_agent_plugin.LOG.warning") as warning,
+            patch("hivemind_ovos_agent_plugin.LOG.debug") as debug,
+        ):
+            agent.handle_internal_mycroft(
+                _ovos_internal("speak", destination=destination)
+            )
+
+        warning.assert_not_called()
+        debug.assert_called_once_with(
+            f"speak - destination is not a peer: {destination}"
+        )
+        alice.send.assert_not_called()
 
     def test_message_addressed_to_stale_peer_is_dropped_without_raising(self, agent, make_client):
         alice = make_client("ws://alice")
