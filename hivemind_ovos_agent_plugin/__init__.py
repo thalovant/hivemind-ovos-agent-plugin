@@ -62,11 +62,12 @@ __all__ = [
 
 
 def _is_peer_id(destination: str) -> bool:
-    """Return whether ``destination`` identifies a HiveMind connection.
+    """Return whether a message destination names a HiveMind peer.
 
-    HiveMind peers contain the ``name::session_id`` separator. OVOS also
-    routes ordinary component labels through ``context["destination"]``;
-    those labels must not be diagnosed as disconnected satellite peers.
+    HiveMind client connections mint peer IDs as ``name::session_id``, with
+    an optional suffix for duplicate live connections. OVOS also uses the
+    destination field for local bus labels such as ``skills`` and skill IDs;
+    those labels are not disconnected HiveMind peers.
     """
     return "::" in destination
 
@@ -1796,6 +1797,15 @@ class OVOSAgentProtocol(AgentProtocol):
             target_peers = [target_peers]
         if not target_peers:
             return
+
+        for destination in target_peers:
+            if (isinstance(destination, str) and destination
+                    and not _is_peer_id(destination)):
+                LOG.debug(
+                    "%s - destination is not a peer: %s",
+                    message.msg_type,
+                    destination,
+                )
 
         session = message.context.get("session")
         if isinstance(session, dict):
