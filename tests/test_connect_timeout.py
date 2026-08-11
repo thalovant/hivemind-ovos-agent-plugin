@@ -1,4 +1,4 @@
-"""The auto-connect branch must fail fast, not hang, when the OVOS bus is down."""
+"""The auto-connect branch must degrade, not hang, when the OVOS bus is down."""
 import socket
 import time
 
@@ -16,16 +16,19 @@ def _closed_port() -> int:
     return port
 
 
-def test_raises_when_messagebus_unreachable():
+def test_starts_degraded_when_messagebus_unreachable(monkeypatch):
     port = _closed_port()
     start = time.monotonic()
-    with pytest.raises(ConnectionError) as exc:
-        # no bus passed -> __post_init__ takes the auto-connect branch and tries
-        # to reach a messagebus that isn't there
-        OVOSAgentProtocol(config={"host": "127.0.0.1", "port": port,
-                                  "connection_timeout": 1})
+    agent = OVOSAgentProtocol(config={"host": "127.0.0.1", "port": port,
+                                      "connection_timeout": 1})
     elapsed = time.monotonic() - start
-    # fails fast (does not hang) and the message is actionable
-    assert elapsed < 10, f"took {elapsed:.1f}s — should fail near the 1s timeout"
-    assert "messagebus" in str(exc.value).lower()
-    assert str(port) in str(exc.value)
+    try:
+        assert elapsed < 10, f"took {elapsed:.1f}s — should stop near the 1s timeout"
+        with pytest.raises(ConnectionError, match="not connected"):
+            agent.get_bus()
+
+        agent.bus.connected_event.set()
+        monkeypatch.setattr(agent.bus, "_transport_is_open", lambda: True)
+        assert agent.get_bus() is agent.bus
+    finally:
+        agent.bus.close()

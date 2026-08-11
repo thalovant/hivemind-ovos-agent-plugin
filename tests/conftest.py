@@ -33,6 +33,7 @@ def agent(fake_bus):
     plugin = OVOSAgentProtocol.__new__(OVOSAgentProtocol)
     plugin.bus = fake_bus
     plugin.config = {}
+    plugin._owned_bus = None
     plugin.hm_protocol = MagicMock()
     plugin.hm_protocol.clients = {}
     plugin.callbacks = ClientCallbacks()

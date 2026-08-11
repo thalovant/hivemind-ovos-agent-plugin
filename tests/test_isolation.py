@@ -1,7 +1,11 @@
 """Client isolation invariant: a client must only receive messages targeted at it."""
 
+from unittest.mock import patch
+
+import pytest
 from ovos_bus_client.message import Message
 from hivemind_bus_client.message import HiveMessageType
+from hivemind_ovos_agent_plugin._metrics import SKILL_HANDLER
 
 
 def _ovos_internal(msg_type, destination=None, data=None):
@@ -11,6 +15,55 @@ def _ovos_internal(msg_type, destination=None, data=None):
 
 
 class TestClientIsolation:
+    def test_private_handler_lifecycle_is_measured_once(self, agent):
+        initial = SKILL_HANDLER.snapshot()["count"]
+        context = {
+            "query_id": "query-1",
+            "session": {"session_id": "query-1"},
+        }
+
+        agent.handle_internal_mycroft(Message(
+            "mycroft.skill.handler.start", {}, context
+        ).serialize())
+        agent.handle_internal_mycroft(Message(
+            "mycroft.skill.handler.complete", {}, context
+        ).serialize())
+
+        assert SKILL_HANDLER.snapshot()["count"] == initial + 1
+
+    @pytest.mark.parametrize("message_type", [
+        "mycroft.skill.handler.start",
+        "mycroft.skill.handler.complete",
+        "ovos.skills.fallback.ping",
+        "ovos.skills.fallback.skill-id.request",
+        "thalovant.runtime.query.prepared",
+    ])
+    def test_runtime_private_events_never_reach_clients(
+            self, agent, make_client, message_type):
+        alice = make_client("ws://alice")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+
+        agent.handle_internal_mycroft(
+            _ovos_internal(message_type, destination="ws://alice")
+        )
+
+        alice.send.assert_not_called()
+
+    @pytest.mark.parametrize("message_type", [
+        "speak",
+        "ovos.utterance.handled",
+    ])
+    def test_public_sdk_replies_remain_routable(
+            self, agent, make_client, message_type):
+        alice = make_client("ws://alice")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+
+        agent.handle_internal_mycroft(
+            _ovos_internal(message_type, destination="ws://alice")
+        )
+
+        alice.send.assert_called_once()
+
     def test_message_addressed_to_one_client_only_reaches_that_client(self, agent, make_client):
         alice = make_client("ws://alice")
         bob = make_client("ws://bob")
@@ -50,6 +103,18 @@ class TestClientIsolation:
         agent.handle_internal_mycroft(_ovos_internal("speak", destination="ws://stranger"))
 
         alice.send.assert_not_called()
+
+    def test_unknown_destination_is_diagnosed(self, agent, make_client):
+        alice = make_client("ws://alice")
+        agent.hm_protocol.clients = {"ws://alice": alice}
+
+        with patch("hivemind_ovos_agent_plugin.LOG.warning") as warning:
+            agent.handle_internal_mycroft(
+                _ovos_internal("speak", destination="ws://stranger")
+            )
+
+        warning.assert_called_once()
+        assert "ws://stranger" in warning.call_args.args[0]
 
     def test_message_addressed_to_stale_peer_is_dropped_without_raising(self, agent, make_client):
         alice = make_client("ws://alice")

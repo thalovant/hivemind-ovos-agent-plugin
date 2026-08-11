@@ -1,4 +1,5 @@
 import logging
+import queue
 import time
 from types import SimpleNamespace
 from threading import Event, Lock, Thread
@@ -52,6 +53,16 @@ def _wait_for_reconnect(client):
     assert worker is not None
     worker.join(timeout=1)
     assert not worker.is_alive()
+
+
+def _queued_client(maxsize=2):
+    """Add the production bounded writer state to a minimal test client."""
+    client = _client()
+    client._bus_write_queue = queue.Queue(maxsize=maxsize)
+    client._bus_writer_stop = Event()
+    client._bus_writer_thread = None
+    client._schedule_reconnect = MagicMock()
+    return client
 
 
 def test_transient_runtime_disconnect_retries_without_warning_or_traceback(
@@ -194,6 +205,93 @@ def test_run_forever_enables_websocket_heartbeat():
         ping_timeout=5.0,
     )
     assert client.started_running is True
+
+
+def test_production_bus_writer_preserves_fifo_order():
+    client = _queued_client()
+    first_started = Event()
+    release_first = Event()
+    sent = []
+
+    def send(message, *, reconnect):
+        assert reconnect is False
+        sent.append(message.msg_type)
+        if message.msg_type == "first":
+            first_started.set()
+            assert release_first.wait(1)
+
+    client._send_synchronously = MagicMock(side_effect=send)
+    client._start_bus_writer()
+    completions = [client._send(Message("first"))]
+    assert first_started.wait(0.2)
+    completions.extend([
+        client._send(Message("second")),
+        client._send(Message("third")),
+    ])
+    release_first.set()
+
+    for completion in completions:
+        assert completion.result(timeout=1) is None
+    client._bus_writer_stop.set()
+    client._bus_writer_thread.join(timeout=1)
+
+    assert sent == ["first", "second", "third"]
+
+
+def test_production_bus_writer_rejects_queue_overload():
+    client = _queued_client(maxsize=1)
+
+    first = client._send(Message("first"))
+    with pytest.raises(TimeoutError, match="write queue is full"):
+        client._send(Message("second"))
+
+    assert not first.done()
+
+
+def test_production_bus_writer_fails_immediately_when_disconnected():
+    client = _queued_client()
+    client.connected_event.clear()
+    client.client.sock.connected = False
+
+    with pytest.raises(ConnectionError, match="not connected"):
+        client._send(Message("first"))
+
+    assert client._bus_write_queue.empty()
+    client._schedule_reconnect.assert_called_once()
+
+
+def test_production_bus_writer_rejects_frames_after_shutdown_begins():
+    """Never enqueue work after the only writer has been asked to stop."""
+    client = _queued_client()
+    client._ensure_reconnect_state()
+    with client._reconnect_state_lock:
+        client._close_requested = True
+        client._bus_writer_stop.set()
+
+    with pytest.raises(ConnectionError, match="is closing"):
+        client._send(Message("too-late"))
+
+    assert client._bus_write_queue.empty()
+
+
+def test_canceled_queued_write_does_not_terminate_the_bus_writer():
+    """Skip abandoned work and keep the single ordered writer available."""
+    client = _queued_client()
+    client._send_synchronously = MagicMock()
+    canceled = client._send(Message("abandoned"))
+    assert canceled.cancel()
+
+    client._start_bus_writer()
+    delivered = client._send(Message("still-live"))
+
+    assert delivered.result(timeout=1) is None
+    client._bus_writer_stop.set()
+    client._bus_writer_thread.join(timeout=1)
+
+    assert not client._bus_writer_thread.is_alive()
+    client._send_synchronously.assert_called_once_with(
+        Message("still-live"), reconnect=False
+    )
 
 
 def test_send_recovers_a_stale_transport_without_leaking_worker(monkeypatch):
@@ -574,7 +672,7 @@ def test_confirmed_query_retries_until_the_runtime_consumer_recovers(monkeypatch
         client, "_wait_for_live_transport", MagicMock(return_value=True)
     )
 
-    client.emit_confirmed(message, 0.01)
+    client.emit_confirmed(message, 0.01, recovery_timeout=0.2)
 
     assert payloads[0] == payloads[1] == payloads[2]
     client._schedule_reconnect.assert_called_once()
