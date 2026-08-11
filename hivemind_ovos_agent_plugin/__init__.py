@@ -1800,7 +1800,8 @@ class OVOSAgentProtocol(AgentProtocol):
 
         for destination in target_peers:
             if (isinstance(destination, str) and destination
-                    and not _is_peer_id(destination)):
+                    and not _is_peer_id(destination)
+                    and destination not in self.clients):
                 LOG.debug(
                     "%s - destination is not a peer: %s",
                     message.msg_type,
@@ -1819,6 +1820,7 @@ class OVOSAgentProtocol(AgentProtocol):
         owned_targets = []
         for peer in target_peers:
             if (isinstance(peer, str) and peer
+                    and (_is_peer_id(peer) or peer in self.clients)
                     and peer not in owned_targets
                     and self._peer_owns_bus(peer, bus)):
                 owned_targets.append(peer)
@@ -1848,12 +1850,6 @@ class OVOSAgentProtocol(AgentProtocol):
             if _is_peer_id(peer):
                 LOG.warning(
                     "%s - destination peer not connected: %s",
-                    message.msg_type,
-                    peer,
-                )
-            else:
-                LOG.debug(
-                    "%s - destination is not a peer: %s",
                     message.msg_type,
                     peer,
                 )
