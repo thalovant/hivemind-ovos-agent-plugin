@@ -970,3 +970,36 @@ def test_an_unbounded_send_still_uses_its_own_timeout():
     client._message_send_timeout = 12.0
     remaining = client._send_deadline() - time.monotonic()
     assert 11.0 < remaining <= 12.0, remaining
+
+
+def test_a_queued_write_keeps_the_deadline_of_the_caller_that_queued_it():
+    """The bound has to travel with the frame, not with the thread.
+
+    `_sending_within` is thread-local and the writer runs on its own thread, so
+    a queued write started a fresh `_message_send_timeout` and could outlive the
+    recovery window that queued it.
+    """
+    import queue as queue_module
+
+    client = _client()
+    client._message_send_timeout = 30.0
+    client._bus_write_queue = queue_module.Queue(maxsize=8)
+    client._bus_writer_stop = Event()
+    observed = []
+
+    def _record(message, reconnect=True):
+        observed.append(client._send_deadline() - time.monotonic())
+
+    client._send_synchronously = _record
+
+    deadline = time.monotonic() + 0.2
+    with client._sending_within(deadline):
+        client._send(Message("speak", {"utterance": "Pfffft."}))
+
+    # Drain one frame the way the writer thread does.
+    client._bus_writer_stop.set()
+    client._run_bus_writer()
+
+    assert observed, "the writer never sent the queued frame"
+    # Bounded by the caller's 0.2s window, not by the 30s send timeout.
+    assert observed[0] <= 0.2 + 1e-6, observed

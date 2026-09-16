@@ -241,7 +241,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
         while (not self._bus_writer_stop.is_set()
                or not self._bus_write_queue.empty()):
             try:
-                enqueued_at, message, completion = self._bus_write_queue.get(
+                enqueued_at, message, completion, deadline = self._bus_write_queue.get(
                     timeout=0.1
                 )
             except queue.Empty:
@@ -257,7 +257,13 @@ class _RuntimeMessageBusClient(MessageBusClient):
                     continue
                 write_started = time.monotonic()
                 try:
-                    self._send_synchronously(message, reconnect=False)
+                    # The caller's bound travels with the frame. `_sending_within`
+                    # is thread-local and this is a different thread, so without
+                    # carrying it a queued write started a fresh
+                    # `_message_send_timeout` and could outlive the recovery
+                    # window that queued it.
+                    with self._sending_within(deadline):
+                        self._send_synchronously(message, reconnect=False)
                 except Exception as error:  # noqa: BLE001
                     # The Future is the asynchronous delivery contract.  Any
                     # normal send failure must reach its caller without
@@ -528,7 +534,8 @@ class _RuntimeMessageBusClient(MessageBusClient):
             else:
                 try:
                     self._bus_write_queue.put_nowait(
-                        (time.monotonic(), message, completion)
+                        (time.monotonic(), message, completion,
+                         getattr(self._sending_state(), "deadline", None))
                     )
                 except queue.Full as error:
                     raise TimeoutError(
