@@ -566,10 +566,17 @@ def test_confirmed_query_accepts_exact_post_transform_receipt():
 
     def acknowledge(payload):
         request = Message.deserialize(payload)
+        # Named, not defaulted: an `else` that answers anything mapped a wrong
+        # frame to a correct receipt, so the test passed on a request
+        # `emit_confirmed` should never have sent.
         if request.msg_type == "thalovant.runtime.query.prepare":
             response_type = "thalovant.runtime.query.prepared"
-        else:
+        elif request.msg_type == "recognizer_loop:utterance":
             response_type = "thalovant.runtime.query.started"
+        else:
+            raise AssertionError(
+                f"unexpected confirmed-query frame: {request.msg_type}"
+            )
         client.emitter.emit(
             response_type,
             request.reply(
@@ -604,9 +611,13 @@ def test_concurrent_confirmed_queries_keep_receipt_subscriptions_immutable():
         if request.msg_type == "thalovant.runtime.query.prepare":
             response_type = "thalovant.runtime.query.prepared"
             query_id = request.data["query_id"]
-        else:
+        elif request.msg_type == "recognizer_loop:utterance":
             response_type = "thalovant.runtime.query.started"
             query_id = request.context["query_id"]
+        else:
+            raise AssertionError(
+                f"unexpected confirmed-query frame: {request.msg_type}"
+            )
         client.emitter.emit(
             response_type,
             request.reply(response_type, {"query_id": query_id}),

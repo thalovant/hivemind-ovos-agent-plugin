@@ -1405,7 +1405,14 @@ class OVOSAgentProtocol(AgentProtocol):
                         token, set()
                     )
                 }
-                if not candidates:
+                # Only when the response named nobody. A reply that carried a
+                # peer or client token which matched no active query is a reply
+                # for somebody else -- very likely a client this replica is not
+                # tracking -- and falling back to the site would hand it to
+                # whichever query happens to share the site_id. That is the
+                # cross-client misrouting this index exists to prevent, so an
+                # unmatched hint has to end the search rather than widen it.
+                if not candidates and not client_tokens:
                     site_tokens = {
                         token for token in tokens
                         if token.startswith("site:")

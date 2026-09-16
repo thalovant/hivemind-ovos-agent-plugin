@@ -100,3 +100,18 @@ path is for advanced/embedded use only.
 
 When the plugin falls back to `Configuration().get("websocket", {})` it reads the
 same keys OVOS itself reads. There is no separate "hivemind" section in `mycroft.conf`.
+
+## Runtime compatibility
+
+The confirmed-delivery path completes a query only on
+`thalovant.runtime.query.started`, the post-transform receipt. A runtime that
+emits only the older `thalovant.runtime.query.accepted` never satisfies it: the
+client retries the exact idempotent frame until `delivery_recovery_timeout`
+expires and then fails the query, so the symptom is a timeout rather than an
+obvious version error.
+
+**Listener and runtime images roll together.** A listener carrying this plugin
+requires an OVOS runtime that emits `thalovant.runtime.query.prepared` and
+`thalovant.runtime.query.started`. Roll both forward together, and roll both
+back together; a mixed pair fails every confirmed query in whichever direction
+the older half sits.

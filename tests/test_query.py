@@ -796,3 +796,50 @@ def test_query_scope_index_is_removed_with_query():
     assert agent._active_query_scopes == {}
     assert agent._active_query_callbacks == {}
     assert agent._active_query_scope_index == {}
+
+
+def test_a_reply_addressed_to_another_client_is_not_taken_by_the_site():
+    """An unmatched peer/client hint ends the search; it does not widen it.
+
+    Falling back to the site when a response *named* somebody -- just not
+    anybody this replica is tracking -- hands that reply to whichever query
+    happens to share the `site_id`. That is the cross-client misrouting the
+    scope index exists to prevent.
+    """
+    agent = _agent()
+
+    def responder(request):
+        query_id = request.context["query_id"]
+        agent.bus.emit(Message(
+            "speak",
+            {"utterance": "meant for somebody else"},
+            {
+                # Named, and named a client with no active query here.
+                "source": "client::a-different-client",
+                "session": {"site_id": "customer-site"},
+                "skill_id": "scope.skill",
+            },
+        ))
+        agent.bus.emit(Message(
+            "ovos.utterance.handled", {}, {"query_id": query_id}
+        ))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {
+            "source": "client::one",
+            "session": {
+                "session_id": "client-session",
+                "site_id": "customer-site",
+            },
+        },
+    )
+
+    chunks = list(agent.answer_query_message(admitted))
+    assert all(
+        chunk is None or chunk.data.get("utterance") != "meant for somebody else"
+        for chunk in chunks
+    ), chunks
+    assert agent._active_query_scopes == {}
