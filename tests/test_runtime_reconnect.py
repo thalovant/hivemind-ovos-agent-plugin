@@ -931,3 +931,42 @@ def test_a_probe_failure_that_is_not_transient_still_surfaces(monkeypatch):
 
     with pytest.raises(ValueError, match="misconfigured"):
         client.ensure_delivery_path(0.01)
+
+
+def test_a_blocked_send_cannot_outlive_the_delivery_window(monkeypatch):
+    """The send underneath a bounded loop obeys that loop's deadline.
+
+    `_send_synchronously` started a fresh `_message_send_timeout` of its own,
+    so a blocked write ran past the recovery window, past the half-query
+    delivery budget, and past the caller's response deadline before the loop
+    noticed. The base class's `emit()` sits in between and takes no deadline,
+    so the bound travels on the sending thread.
+    """
+    client = _client()
+    client._message_send_timeout = 30.0
+    observed = []
+
+    def _probe(_timeout):
+        observed.append(client._send_deadline() - time.monotonic())
+        return True
+
+    monkeypatch.setattr(client, "_probe_delivery_once", _probe)
+    monkeypatch.setattr(client, "_schedule_reconnect", MagicMock())
+    monkeypatch.setattr(client, "_wait_for_live_transport", MagicMock(
+        return_value=True
+    ))
+    client._delivery_recovery_timeout = 0.2
+
+    client.ensure_delivery_path(0.01)
+
+    assert observed, "the probe never ran"
+    # Bounded by the recovery window (0.2s), not by the send timeout (30s).
+    assert observed[0] <= 0.2 + 1e-6, observed
+
+
+def test_an_unbounded_send_still_uses_its_own_timeout():
+    """Outside a bounded loop the send keeps the timeout it always had."""
+    client = _client()
+    client._message_send_timeout = 12.0
+    remaining = client._send_deadline() - time.monotonic()
+    assert 11.0 < remaining <= 12.0, remaining

@@ -9,7 +9,8 @@ import uuid
 from collections import OrderedDict
 from concurrent.futures import Future
 from copy import deepcopy
-from threading import Event, Lock, Thread, current_thread
+from contextlib import contextmanager
+from threading import Event, Lock, Thread, current_thread, local
 from typing import Callable, Dict, Any, Iterator, Optional, Set, Tuple
 
 from ovos_bus_client import MessageBusClient
@@ -131,6 +132,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
         self._disconnect_escalated = False
         self._reconnect_state_lock = Lock()
         self._send_lock = Lock()
+        self._sending = local()
         self._bus_write_queue = queue.Queue(
             maxsize=self._positive_int(bus_write_queue_size, 256)
         )
@@ -555,7 +557,7 @@ class _RuntimeMessageBusClient(MessageBusClient):
             payload = json_dumps(message.__dict__)
             message_type = type(message).__name__
         payload = _maybe_encrypt(payload)
-        deadline = time.monotonic() + self._message_send_timeout
+        deadline = self._send_deadline()
         last_error = None
 
         attempts = 2 if reconnect else 1
@@ -619,6 +621,44 @@ class _RuntimeMessageBusClient(MessageBusClient):
             finally:
                 if lock_acquired:
                     self._send_lock.release()
+
+    @contextmanager
+    def _sending_within(self, deadline):
+        """Bound this thread's sends by an absolute deadline.
+
+        ``emit_confirmed`` and ``ensure_delivery_path`` own a shared recovery
+        window, but the send underneath them started a fresh
+        ``_message_send_timeout`` of its own -- so a blocked write could run
+        past the window, past the half-query delivery budget, and past the
+        caller's response deadline before the loop noticed. The base class's
+        ``emit()`` sits between them and takes no deadline, so the value is
+        carried on the thread that is sending rather than through the call.
+        """
+        sending = self._sending_state()
+        previous = getattr(sending, "deadline", None)
+        sending.deadline = deadline
+        try:
+            yield
+        finally:
+            sending.deadline = previous
+
+    def _sending_state(self):
+        """This thread's send state, created on demand.
+
+        Legacy subclasses and test instances bypass ``__init__``, the same
+        reason ``_send`` checks for its writer queue before using it.
+        """
+        sending = getattr(self, "_sending", None)
+        if sending is None:
+            sending = local()
+            self._sending = sending
+        return sending
+
+    def _send_deadline(self):
+        """The earlier of this thread's imposed deadline and the send timeout."""
+        own = time.monotonic() + self._message_send_timeout
+        imposed = getattr(self._sending_state(), "deadline", None)
+        return own if imposed is None else min(own, imposed)
 
     def _is_recoverable_delivery_error(self, error):
         """A send failure the bounded delivery loops should retry, not surface.
@@ -703,7 +743,8 @@ class _RuntimeMessageBusClient(MessageBusClient):
                         )
                     received.clear()
                     try:
-                        self.emit(request)
+                        with self._sending_within(deadline):
+                            self.emit(request)
                     except Exception as error:
                         # Same reasoning as the probe loop: a transient send
                         # failure is what the shared deadline is for, and
@@ -781,7 +822,9 @@ class _RuntimeMessageBusClient(MessageBusClient):
             if remaining <= 0:
                 break
             try:
-                if self._probe_delivery_once(min(timeout, remaining)):
+                with self._sending_within(deadline):
+                    probed = self._probe_delivery_once(min(timeout, remaining))
+                if probed:
                     return
                 last_error = TimeoutError(
                     "OVOS intent service did not answer the delivery probe "
