@@ -3,7 +3,7 @@ import queue
 import time
 from types import SimpleNamespace
 from threading import Event, Lock, Thread
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from websocket import (WebSocketAddressException,
@@ -18,11 +18,30 @@ from hivemind_ovos_agent_plugin import (
 from pyee import EventEmitter
 from ovos_bus_client import MessageBusClient
 from ovos_bus_client.message import Message
+from ovos_bus_client.session import Session
 
 
 def _client():
-    """Build a minimal runtime bus client with observable collaborators."""
+    """Build a minimal runtime bus client with observable collaborators.
+
+    Deliberately built with ``__new__``: these tests drive the reconnect and
+    delivery paths directly, and a real ``__init__`` would also start the bus
+    writer thread and change which send path they exercise.
+
+    The base ``__init__`` still runs, with ``create_client`` patched out so no
+    socket is built. Enumerating the attributes it sets was the alternative,
+    and every ovos-bus-client release that read a new one on the emit path
+    broke every test here with an ``AttributeError`` that said nothing about
+    the plugin -- ``session``, then ``_translator``, then
+    ``_wire_legacy_twins``.
+    """
     client = _RuntimeMessageBusClient.__new__(_RuntimeMessageBusClient)
+    with patch.object(MessageBusClient, "create_client",
+                      return_value=MagicMock()):
+        MessageBusClient.__init__(
+            client, host="runtime", port=8181, route="/core", ssl=False,
+            emitter=MagicMock(),
+        )
     client._disconnect_started_at = None
     client._disconnect_escalated = False
     client._reconnect_error_after = 120.0
@@ -31,6 +50,7 @@ def _client():
     client._ping_interval = 15.0
     client._ping_timeout = 5.0
     client.session_id = "runtime-probe-test"
+    client.session = Session(client.session_id)
     client.retry = 5
     client.connected_event = Event()
     client.connected_event.set()
