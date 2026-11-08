@@ -23,7 +23,8 @@ The plugin is configured by the `hivemind-core` `agent_protocol` block.
 | `bus_write_queue_size` | integer | `256` | Maximum ordered OVOS-bus writes waiting behind the single writer; overload fails immediately. |
 | `ping_interval` | number | `15` | WebSocket ping interval used to detect half-open runtime connections. |
 | `ping_timeout` | number | `5` | Seconds to wait for a runtime-bus pong; must be below `ping_interval`. |
-| `delivery_probe_timeout` | number | `2` | Maximum seconds for each application-level runtime probe or receipt attempt. |
+| `delivery_probe_timeout` | number | `2` | Maximum seconds for each application-level runtime delivery probe. It does not bound receipt waits; those use `query_accept_timeout`. |
+| `query_accept_timeout` | number | `2` | Maximum seconds to wait for one query receipt (the reservation, then the post-transform pipeline start) before retrying inside `delivery_recovery_timeout`. |
 | `delivery_recovery_timeout` | number | `20` | Maximum shared window for exact, idempotent query reservation and post-transform pipeline start while the OVOS core consumer reconnects. The effective query-delivery budget is also capped at half of `query_timeout`. |
 | `runtime_shards` | array | unset | Named, unique OVOS messagebus endpoints used for deterministic client-to-runtime routing. Maximum 64. |
 | `reply_dedupe_seconds` | number | `5` | Short window for suppressing an exact repeated correlated public reply in sharded mode. |
