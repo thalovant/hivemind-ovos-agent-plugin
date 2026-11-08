@@ -60,6 +60,10 @@ __all__ = [
     "__version__",
 ]
 
+# Seconds a bounded delivery loop waits after a failed send before retrying,
+# so an error that leaves the transport open cannot spin a query worker.
+_DELIVERY_RETRY_PAUSE = 0.1
+
 
 def _is_peer_id(destination: str) -> bool:
     """Return whether a message destination names a HiveMind peer.
@@ -293,7 +297,12 @@ class _RuntimeMessageBusClient(MessageBusClient):
             self._query_receipt_dispatchers = {}
             self._query_receipt_dispatcher_setup_lock = Lock()
         with self._query_receipt_dispatcher_setup_lock:
-            if self._query_receipt_dispatchers:
+            # The handlers live on one emitter. If ``self.emitter`` is ever
+            # replaced, the new one has none, and a confirmed query would wait
+            # for a receipt nobody routes; install on the emitter in use.
+            if (self._query_receipt_dispatchers
+                    and getattr(self, "_query_receipt_dispatcher_emitter",
+                                None) is self.emitter):
                 return
             def dispatch(event_type):
                 def _handler(response):
@@ -314,11 +323,17 @@ class _RuntimeMessageBusClient(MessageBusClient):
                             self.emitter.remove_listener(
                                 installed_type, installed_callback
                             )
-                        except Exception:
-                            pass
+                        except Exception as rollback_error:  # noqa: BLE001
+                            # The installation failure is the one to raise;
+                            # a listener left behind still deserves a line.
+                            LOG.debug(
+                                "Could not roll back query receipt listener "
+                                "%s: %s", installed_type, rollback_error
+                            )
                     raise
                 installed.append((response_type, callback))
             self._query_receipt_dispatchers = dict(installed)
+            self._query_receipt_dispatcher_emitter = self.emitter
 
     def _dispatch_query_receipt(self, response_type, response):
         """Wake only waiters for the exact query receipt."""
@@ -613,6 +628,44 @@ class _RuntimeMessageBusClient(MessageBusClient):
                 if lock_acquired:
                     self._send_lock.release()
 
+    def _is_recoverable_delivery_error(self, error: BaseException) -> bool:
+        """Return whether a bounded delivery loop should retry a send failure.
+
+        ``_send`` raises ``ConnectionError`` for a disconnected transport and
+        ``TimeoutError`` for a full write queue; the synchronous path raises
+        the same pair for a reconnect or blocked write that ran out of time.
+        Those describe the stale path the delivery loops exist to replace.
+        An intentional shutdown also raises ``ConnectionError``, and retrying
+        it would only hold the caller until the deadline, so it surfaces.
+        """
+        self._ensure_reconnect_state()
+        if self._close_requested:
+            return False
+        writer_stop = getattr(self, "_bus_writer_stop", None)
+        if writer_stop is not None and writer_stop.is_set():
+            return False
+        return self._is_transient_disconnect(error)
+
+    def _await_delivery_retry(self, error: BaseException, deadline: float,
+                              reconnected: bool) -> bool:
+        """Recover from one failed send inside a bounded delivery loop.
+
+        Reconnect at most once per loop, wait for a live transport within the
+        loop's deadline, then pause briefly: a failure that leaves the
+        transport open (a full write queue) must not become a busy spin.
+        Returns the updated ``reconnected`` flag.
+        """
+        if not reconnected:
+            self._schedule_reconnect(error)
+            reconnected = True
+        self._wait_for_live_transport(min(
+            deadline, time.monotonic() + self._message_send_timeout
+        ))
+        pause = min(_DELIVERY_RETRY_PAUSE, deadline - time.monotonic())
+        if pause > 0:
+            time.sleep(pause)
+        return reconnected
+
     def _probe_delivery_once(self, timeout):
         """Prove the OVOS intent service consumed and answered one probe."""
         probe_id = uuid.uuid4().hex
@@ -683,7 +736,17 @@ class _RuntimeMessageBusClient(MessageBusClient):
                             f"{recovery_timeout:.1f}-second delivery window"
                         )
                     received.clear()
-                    self.emit(request)
+                    try:
+                        self.emit(request)
+                    except Exception as error:  # noqa: BLE001
+                        # A transient send failure is what the shared deadline
+                        # is for; raising here would spend none of it.
+                        if not self._is_recoverable_delivery_error(error):
+                            raise
+                        reconnected = self._await_delivery_retry(
+                            error, deadline, reconnected
+                        )
+                        continue
                     remaining = deadline - time.monotonic()
                     if remaining > 0 and received.wait(min(timeout, remaining)):
                         break
@@ -743,8 +806,19 @@ class _RuntimeMessageBusClient(MessageBusClient):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            if self._probe_delivery_once(min(timeout, remaining)):
-                return
+            try:
+                if self._probe_delivery_once(min(timeout, remaining)):
+                    return
+            except Exception as error:  # noqa: BLE001
+                # The probe emits, so it raises whatever a send raises. A
+                # transient failure is the condition this window is bounded
+                # for; anything else is the caller's to see.
+                if not self._is_recoverable_delivery_error(error):
+                    raise
+                reconnected = self._await_delivery_retry(
+                    error, deadline, reconnected
+                )
+                continue
 
             last_error = TimeoutError(
                 "OVOS intent service did not answer the delivery probe within "
@@ -1305,8 +1379,13 @@ class OVOSAgentProtocol(AgentProtocol):
                 for event_name, callback in reversed(installed):
                     try:
                         bus.remove(event_name, callback)
-                    except Exception:
-                        pass
+                    except Exception as rollback_error:  # noqa: BLE001
+                        # The installation failure is the one to raise; a
+                        # handler left behind still deserves a line.
+                        LOG.debug(
+                            "Could not roll back query dispatcher handler "
+                            "%s: %s", event_name, rollback_error
+                        )
                 raise
             self._query_dispatcher_handlers[bus_id] = registrations
             self._query_dispatcher_buses.add(bus_id)
@@ -1491,7 +1570,16 @@ class OVOSAgentProtocol(AgentProtocol):
             }
             # A server-admitted client route is more specific than a site:
             # many identities may legitimately share one site during load.
-            if not candidates:
+            # Fall back to the site only when the reply named no client: a
+            # client ID or HiveMind peer ID that matches no active query is a
+            # reply for somebody else, and widening to the site would hand it
+            # to whichever query happens to share that site. OVOS bus labels
+            # such as ``skills`` name no client and keep the site fallback.
+            names_a_client = any(
+                token.startswith("client:") or _is_peer_id(token[5:])
+                for token in client_tokens
+            )
+            if not candidates and not names_a_client:
                 site_tokens = {
                     token for token in tokens if token.startswith("site:")
                 }

@@ -796,3 +796,74 @@ def test_query_scope_index_is_removed_with_query():
     assert agent._active_query_scopes == {}
     assert agent._active_query_callbacks == {}
     assert agent._active_query_scope_index == {}
+
+
+def _site_query_with_reply(agent, reply_context):
+    """Run one site-scoped query whose only reply carries ``reply_context``."""
+    def responder(request):
+        query_id = request.context["query_id"]
+        agent.bus.emit(Message(
+            "speak", {"utterance": "uncorrelated answer"}, reply_context
+        ))
+        agent.bus.emit(Message(
+            "ovos.utterance.handled", {}, {"query_id": query_id}
+        ))
+
+    agent.bus.on("recognizer_loop:utterance", responder)
+    admitted = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {
+            "source": "client::one",
+            "session": {
+                "session_id": "client-session",
+                "site_id": "customer-site",
+            },
+        },
+    )
+    return list(agent.answer_query_message(admitted))
+
+
+def _utterances(chunks):
+    return [
+        chunk.data.get("utterance") for chunk in chunks if chunk is not None
+    ]
+
+
+def test_reply_naming_another_client_is_not_taken_by_the_site():
+    """An unmatched client hint ends the search instead of widening it."""
+    agent = _agent()
+
+    chunks = _site_query_with_reply(agent, {
+        "source": "client::a-different-client",
+        "session": {"site_id": "customer-site"},
+        "skill_id": "scope.skill",
+    })
+
+    assert "uncorrelated answer" not in _utterances(chunks)
+    assert agent._active_query_scopes == {}
+
+
+def test_reply_naming_an_unknown_session_client_is_not_taken_by_the_site():
+    """A session ``client_id`` that matches no query is somebody else's."""
+    agent = _agent()
+
+    chunks = _site_query_with_reply(agent, {
+        "session": {"site_id": "customer-site", "client_id": "other"},
+        "skill_id": "scope.skill",
+    })
+
+    assert "uncorrelated answer" not in _utterances(chunks)
+
+
+def test_reply_from_an_ovos_label_keeps_the_site_fallback():
+    """``skills`` is a bus label, not a client, so the site still scopes it."""
+    agent = _agent()
+
+    chunks = _site_query_with_reply(agent, {
+        "source": "skills",
+        "session": {"site_id": "customer-site"},
+        "skill_id": "scope.skill",
+    })
+
+    assert _utterances(chunks) == ["uncorrelated answer"]

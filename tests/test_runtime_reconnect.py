@@ -3,7 +3,7 @@ import queue
 import time
 from types import SimpleNamespace
 from threading import Event, Lock, Thread
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from websocket import (WebSocketAddressException,
@@ -18,11 +18,30 @@ from hivemind_ovos_agent_plugin import (
 from pyee import EventEmitter
 from ovos_bus_client import MessageBusClient
 from ovos_bus_client.message import Message
+from ovos_bus_client.session import Session
 
 
 def _client():
-    """Build a minimal runtime bus client with observable collaborators."""
+    """Build a minimal runtime bus client with observable collaborators.
+
+    Deliberately built with ``__new__``: these tests drive the reconnect and
+    delivery paths directly, and a real ``__init__`` would also start the bus
+    writer thread and change which send path they exercise.
+
+    The base ``__init__`` still runs, with ``create_client`` patched out so no
+    socket is built. Enumerating the attributes it sets was the alternative,
+    and every ovos-bus-client release that read a new one on the emit path
+    broke every test here with an ``AttributeError`` that said nothing about
+    the plugin -- ``session``, then ``_translator``, then
+    ``_wire_legacy_twins``.
+    """
     client = _RuntimeMessageBusClient.__new__(_RuntimeMessageBusClient)
+    with patch.object(MessageBusClient, "create_client",
+                      return_value=MagicMock()):
+        MessageBusClient.__init__(
+            client, host="runtime", port=8181, route="/core", ssl=False,
+            emitter=MagicMock(),
+        )
     client._disconnect_started_at = None
     client._disconnect_escalated = False
     client._reconnect_error_after = 120.0
@@ -31,6 +50,7 @@ def _client():
     client._ping_interval = 15.0
     client._ping_timeout = 5.0
     client.session_id = "runtime-probe-test"
+    client.session = Session(client.session_id)
     client.retry = 5
     client.connected_event = Event()
     client.connected_event.set()
@@ -858,3 +878,212 @@ def test_websocket_filter_installation_is_idempotent(monkeypatch):
         isinstance(item, _TransientWebsocketDisconnectFilter)
         for item in logger.filters
     ) == 1
+
+
+def _acknowledging_sender(client, query_id, *, failures):
+    """Fail the first ``failures`` frame writes, then answer every stage."""
+    writes = []
+
+    def send(payload):
+        writes.append(payload)
+        if len(writes) <= failures:
+            raise WebSocketConnectionClosedException("runtime bus restarted")
+        request = Message.deserialize(payload)
+        if request.msg_type == "thalovant.runtime.query.prepare":
+            response_type = "thalovant.runtime.query.prepared"
+        elif request.msg_type == "recognizer_loop:utterance":
+            response_type = "thalovant.runtime.query.started"
+        else:
+            raise AssertionError(
+                f"unexpected confirmed-query frame: {request.msg_type}"
+            )
+        client.emitter.emit(
+            response_type,
+            request.reply(response_type, {"query_id": query_id}),
+        )
+
+    return send, writes
+
+
+def test_confirmed_query_retries_a_transient_send_failure(monkeypatch):
+    """A send that fails mid-window is retried, not raised to the caller.
+
+    Two failed writes exhaust the synchronous send's own single retry, so
+    ``emit`` raises ``ConnectionError`` into ``emit_confirmed``. The shared
+    delivery window exists for exactly that stale path.
+    """
+    client = _client()
+    client.emitter = EventEmitter()
+    message = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"query_id": "query-1"},
+    )
+    send, writes = _acknowledging_sender(client, "query-1", failures=2)
+    client.client.send.side_effect = send
+    monkeypatch.setattr(client, "_schedule_reconnect", MagicMock())
+    monkeypatch.setattr(
+        client, "_wait_for_live_transport", MagicMock(return_value=True)
+    )
+
+    client.emit_confirmed(message, 0.05, recovery_timeout=1.0)
+
+    prepares = [
+        payload for payload in writes
+        if Message.deserialize(payload).msg_type
+        == "thalovant.runtime.query.prepare"
+    ]
+    # The exact reservation frame was written three times: twice failing,
+    # once acknowledged. The pipeline start then went through first time.
+    assert len(prepares) == 3 and len(set(prepares)) == 1
+    assert len(writes) == 4
+    client._schedule_reconnect.assert_called()
+
+
+def test_confirmed_query_does_not_spin_on_an_open_transport(monkeypatch):
+    """A failure that leaves the transport open waits before each retry."""
+    client = _client()
+    client.emitter = EventEmitter()
+    message = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"query_id": "query-1"},
+    )
+    emit = MagicMock(side_effect=TimeoutError("write queue is full"))
+    monkeypatch.setattr(client, "emit", emit)
+    monkeypatch.setattr(client, "_schedule_reconnect", MagicMock())
+    monkeypatch.setattr(
+        client, "_wait_for_live_transport", MagicMock(return_value=True)
+    )
+
+    with pytest.raises(TimeoutError, match="delivery window"):
+        client.emit_confirmed(message, 0.05, recovery_timeout=0.35)
+
+    # One attempt per retry pause, not thousands in a busy loop.
+    assert 2 <= emit.call_count <= 6
+    client._schedule_reconnect.assert_called_once()
+
+
+def test_confirmed_query_surfaces_a_send_failure_during_shutdown(monkeypatch):
+    """An intentional close is not a stale path: fail now, not at the deadline."""
+    client = _client()
+    client.emitter = EventEmitter()
+    client._ensure_reconnect_state()
+    client._close_requested = True
+    emit = MagicMock(side_effect=ConnectionError("OVOS messagebus is closing"))
+    monkeypatch.setattr(client, "emit", emit)
+    monkeypatch.setattr(client, "_wait_for_live_transport", MagicMock())
+    message = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"query_id": "query-1"},
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ConnectionError, match="closing"):
+        client.emit_confirmed(message, 0.05, recovery_timeout=5.0)
+
+    assert time.monotonic() - started < 1.0
+    emit.assert_called_once()
+    client._wait_for_live_transport.assert_not_called()
+
+
+def test_confirmed_query_surfaces_a_non_transient_send_failure(monkeypatch):
+    """Only stale-path failures are absorbed; a programming error is not."""
+    client = _client()
+    client.emitter = EventEmitter()
+    monkeypatch.setattr(
+        client, "emit", MagicMock(side_effect=ValueError("bad frame"))
+    )
+    message = Message(
+        "recognizer_loop:utterance",
+        {"utterances": ["hello"]},
+        {"query_id": "query-1"},
+    )
+
+    with pytest.raises(ValueError, match="bad frame"):
+        client.emit_confirmed(message, 0.05, recovery_timeout=5.0)
+
+
+def test_delivery_probe_retries_a_transient_send_failure(monkeypatch):
+    """A probe that raises spends the recovery window instead of escaping it."""
+    client = _client()
+    client._delivery_recovery_timeout = 1.0
+    probe = MagicMock(side_effect=[
+        ConnectionError("bus closed while sending"),
+        TimeoutError("frame write remained blocked"),
+        True,
+    ])
+    reconnect = MagicMock()
+    monkeypatch.setattr(client, "_probe_delivery_once", probe)
+    monkeypatch.setattr(client, "_schedule_reconnect", reconnect)
+    monkeypatch.setattr(client, "_wait_for_live_transport", MagicMock(
+        return_value=True
+    ))
+
+    client.ensure_delivery_path(0.01)
+
+    assert probe.call_count == 3
+    reconnect.assert_called_once()
+
+
+def test_delivery_probe_surfaces_a_non_transient_failure(monkeypatch):
+    """A probe error that is not a stale path reaches the caller untouched."""
+    client = _client()
+    client._delivery_recovery_timeout = 1.0
+    monkeypatch.setattr(client, "_probe_delivery_once", MagicMock(
+        side_effect=ValueError("probe is misconfigured")
+    ))
+    monkeypatch.setattr(client, "_schedule_reconnect", MagicMock())
+    monkeypatch.setattr(client, "_wait_for_live_transport", MagicMock(
+        return_value=True
+    ))
+
+    with pytest.raises(ValueError, match="misconfigured"):
+        client.ensure_delivery_path(0.01)
+    client._schedule_reconnect.assert_not_called()
+
+
+def test_receipt_dispatchers_follow_a_replaced_emitter():
+    """Receipt handlers are installed on the emitter in use, not the first one."""
+    client = _client()
+    first = EventEmitter()
+    client.emitter = first
+    client._ensure_query_receipt_dispatchers()
+    assert first.listeners("thalovant.runtime.query.started")
+
+    replacement = EventEmitter()
+    client.emitter = replacement
+    received = client._register_query_receipt(
+        "thalovant.runtime.query.started", "query-1"
+    )
+    try:
+        replacement.emit(
+            "thalovant.runtime.query.started",
+            Message("thalovant.runtime.query.started", {"query_id": "query-1"}),
+        )
+        assert received.is_set()
+    finally:
+        client._unregister_query_receipt(
+            "thalovant.runtime.query.started", "query-1", received
+        )
+    # Installing again on the same emitter stays a no-op.
+    client._ensure_query_receipt_dispatchers()
+    assert len(replacement.listeners("thalovant.runtime.query.started")) == 1
+
+
+def test_receipt_dispatcher_rollback_failure_is_logged(monkeypatch):
+    """A listener left behind by a failed rollback is reported, not hidden."""
+    client = _client()
+    emitter = MagicMock()
+    emitter.on.side_effect = [None, RuntimeError("emitter rejected listener")]
+    emitter.remove_listener.side_effect = KeyError("already gone")
+    client.emitter = emitter
+    debug = MagicMock()
+    monkeypatch.setattr(agent_module.LOG, "debug", debug)
+
+    with pytest.raises(RuntimeError, match="rejected listener"):
+        client._ensure_query_receipt_dispatchers()
+
+    debug.assert_called_once()
+    assert "roll back query receipt listener" in debug.call_args.args[0]
